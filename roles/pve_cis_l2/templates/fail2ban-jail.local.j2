@@ -1,0 +1,16 @@
+# {{ ansible_managed }} — CIS 7.5 / 7.6
+[DEFAULT]
+bantime  = {{ pve_cis_fail2ban.bantime }}
+findtime = {{ pve_cis_fail2ban.findtime }}
+maxretry = {{ pve_cis_fail2ban.maxretry }}
+backend  = systemd
+
+[sshd]
+enabled = true
+
+[proxmox]
+enabled = true
+port    = https,http,8006
+filter  = proxmox
+logpath = /var/log/daemon.log
+maxretry = {{ pve_cis_fail2ban.maxretry }}

@@ -1,0 +1,7 @@
+# {{ ansible_managed }} — CIS 7.2
+{% if pve_cis_pveproxy_listen_ip | length > 0 %}
+LISTEN_IP="{{ pve_cis_pveproxy_listen_ip }}"
+{% endif %}
+# TLS 1.2+ uniquement (CIS 7.3)
+HONOR_CIPHER_ORDER=1
+TLS_PROTOCOL="TLSv1.2"

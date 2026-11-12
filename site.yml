@@ -1,0 +1,44 @@
+---
+- name: Proxmox VE CIS Level 2 hardening
+  hosts: pve_nodes
+  become: true
+  gather_facts: true
+  any_errors_fatal: false
+
+  pre_tasks:
+    - name: Verify target is Proxmox VE
+      ansible.builtin.stat:
+        path: /usr/bin/pveversion
+      register: _pve_bin
+      failed_when: not _pve_bin.stat.exists
+
+    - name: Record PVE version
+      ansible.builtin.command: pveversion
+      changed_when: false
+      register: _pve_version
+
+    - name: Show target
+      ansible.builtin.debug:
+        msg: "Hardening CIS L2 sur {{ inventory_hostname }} — {{ _pve_version.stdout }}"
+
+  roles:
+    - role: pve_cis_l2
+
+  post_tasks:
+    - name: Copy audit script to node
+      ansible.builtin.copy:
+        src: scripts/audit-cis.sh
+        dest: /usr/local/sbin/audit-cis.sh
+        mode: "0750"
+      tags: [audit]
+
+    - name: Run CIS L2 audit
+      ansible.builtin.command: /usr/local/sbin/audit-cis.sh
+      changed_when: false
+      register: _audit
+      tags: [audit]
+
+    - name: Audit report
+      ansible.builtin.debug:
+        msg: "{{ _audit.stdout_lines }}"
+      tags: [audit]

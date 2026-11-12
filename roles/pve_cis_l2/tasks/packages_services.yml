@@ -1,0 +1,49 @@
+---
+- name: CIS 2.2 — Supprimer les services inutiles
+  ansible.builtin.apt:
+    name: "{{ pve_cis_services_absent }}"
+    state: absent
+    purge: true
+    autoremove: true
+
+- name: CIS 2.2 — Masquer rsync
+  ansible.builtin.systemd:
+    name: rsync
+    masked: true
+    enabled: false
+  when: pve_cis_rsync_masked | bool
+
+- name: CIS 2.x — Installer les paquets requis
+  ansible.builtin.apt:
+    name: "{{ pve_cis_packages_present }}"
+    state: present
+    update_cache: true
+
+- name: CIS 2.3.2 — Cron d'intégrité AIDE
+  ansible.builtin.copy:
+    dest: /etc/cron.d/aidecheck
+    content: |
+      05 4 * * * root /usr/bin/aide --check
+    mode: "0644"
+  when: "'aide' in pve_cis_packages_present"
+
+- name: CIS 2.3.1 — Initialiser la base AIDE (peut prendre plusieurs minutes)
+  ansible.builtin.command: aideinit -y -f
+  args:
+    creates: /var/lib/aide/aide.db
+  when: pve_cis_aide_init | bool
+
+- name: CIS 2.4 — Mises à jour automatiques de sécurité
+  ansible.builtin.apt:
+    name: unattended-upgrades
+    state: present
+  when: pve_cis_unattended_upgrades | bool
+
+- name: CIS 2.4 — Activer unattended-upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+    mode: "0644"
+  when: pve_cis_unattended_upgrades | bool

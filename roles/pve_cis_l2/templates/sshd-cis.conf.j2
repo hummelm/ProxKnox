@@ -1,0 +1,4 @@
+# {{ ansible_managed }} — CIS 5.8 (drop-in prioritaire)
+{% for key, value in pve_cis_sshd.items() %}
+{{ key }} {{ value }}
+{% endfor %}
