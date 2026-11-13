@@ -1,0 +1,45 @@
+---
+# Configuration Ansible Lockdown DEBIAN13-CIS — CIS Level 2 (server)
+# Référence : https://github.com/ansible-lockdown/DEBIAN13-CIS (benchmark v1.0.0)
+
+# Niveau CIS
+deb13cis_level_1: true
+deb13cis_level_2: true
+
+# Contrôles à impact élevé activés (lab — L2 complet)
+deb13cis_disruption_high: true
+
+# Proxmox VE est un hyperviseur : forwarding IPv4 requis (SDN/NAT/firewall PVE).
+# Évince les contrôles 3.3.1.x ip_forward/forwarding.
+deb13cis_is_router: true
+
+# IPv6 conservé (défaut PVE)
+deb13cis_ipv6_required: true
+
+# Toutes les sections
+deb13cis_section1: true
+deb13cis_section2: true
+deb13cis_section3: true
+deb13cis_section4: true
+deb13cis_section5: true
+deb13cis_section6: true
+deb13cis_section7: true
+
+# Reboot avant l'audit final (meilleurs résultats)
+skip_reboot: false
+change_requires_reboot: true
+
+# ---------------- Audit automatisé (syver + DEBIAN13-CIS-Audit) -------------
+setup_audit: true
+run_audit: true
+audit_only: false
+audit_run_heavy_tests: true
+
+# Récupération du contenu d'audit (branche benchmark v1.0.0) et du binaire syver
+audit_content: git
+get_audit_binary_method: download
+
+# Rapports ramenés sur le contrôleur
+fetch_audit_output: true
+audit_output_collection_method: fetch
+audit_output_destination: "{{ playbook_dir }}/audit-summaries/"

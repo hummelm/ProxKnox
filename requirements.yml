@@ -1,4 +1,10 @@
 ---
 collections:
   - name: community.general
+  - name: community.crypto
   - name: ansible.posix
+
+roles:
+  - name: ansible-lockdown.DEBIAN13-CIS
+    src: https://github.com/ansible-lockdown/DEBIAN13-CIS.git
+    version: 1.1.0
