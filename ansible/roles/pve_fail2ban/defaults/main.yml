@@ -1,0 +1,9 @@
+---
+# pve_fail2ban — HSE PVE9 Hardening Guide § 2.3.3
+# Fail2ban on sshd + the Proxmox UI/API (pvedaemon).
+
+# SSH port(s) actually listened on by the node (lab: 2222, cf. preseed)
+pve_fail2ban_sshd_port: 2222
+pve_fail2ban_maxretry: 3
+pve_fail2ban_findtime: 2h
+pve_fail2ban_bantime: 1h

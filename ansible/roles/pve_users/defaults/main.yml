@@ -1,0 +1,28 @@
+---
+# pve_users — HSE PVE9 Hardening Guide § 2.1.1, § 2.1.2, § 2.1.3, § 2.1.5,
+#             § 2.2.1, § 2.2.2, § 2.2.4
+# Custom PVE accounts (RBAC), optional 2FA requirement, automation API
+# tokens with a restricted scope and expiration.
+
+# @pam users MUST exist as system accounts on the node
+# (e.g. adminlab created by the ProxKnox preseed).
+#
+# pve_users:
+#   - userid: adminlab@pam
+#     comment: "lab admin"
+#     role: Administrator     # least privilege: minimal PVE role
+#     path: /                  # ACL scope
+pve_users: []
+
+# Require 2FA (TOTP) for the pam/pve realms — /!\ before enabling:
+# every user must be enrolled, otherwise root@pam becomes unusable
+# for the UI (§ 2.1.3, break-glass exception § 2.1.4).
+pve_users_require_2fa: false
+
+# Automation API tokens (created with expiration, reduced scope:
+# dedicated user + minimal role) — § 2.2.1/2.2.2/2.2.4.
+# pve_api_tokens:
+#   - userid: botops@pam
+#     tokenid: ci
+#     expire: 2026-12-31
+pve_api_tokens: []

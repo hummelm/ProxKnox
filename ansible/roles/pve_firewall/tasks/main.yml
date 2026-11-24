@@ -1,0 +1,122 @@
+---
+# /!\ operation order: the allow rules must be ACTIVE before enabling the
+# firewall — otherwise input DROP locks out the node.
+- name: List the datacenter firewall rules
+  ansible.builtin.command: pvesh get /cluster/firewall/rules --output-format json
+  register: _fw_rules
+  changed_when: false
+  failed_when: false
+
+- name: Re-enable role rules left disabled (previous run)
+  ansible.builtin.command: "pvesh set /cluster/firewall/rules/{{ item.pos }} --enable 1"
+  loop: "{{ _fw_rules.stdout | from_json
+            | selectattr('comment', 'defined')
+            | selectattr('comment', 'match', '^' ~ pve_firewall_comment_prefix)
+            | selectattr('enable', 'defined')
+            | selectattr('enable', '!=', 1)
+            | list }}"
+  loop_control:
+    label: "{{ item.get('comment', '') }}@{{ item.pos }}"
+
+- name: Refresh the rule list
+  ansible.builtin.command: pvesh get /cluster/firewall/rules --output-format json
+  register: _fw_rules2
+  changed_when: false
+  failed_when: false
+
+# strict idempotency: a rule only counts as "present" if ACTIVE
+- name: GUI 8006 allow rules from trusted subnets (§ 1.2.4)
+  ansible.builtin.command: >-
+    pvesh create /cluster/firewall/rules
+    --type in --action ACCEPT --proto tcp --dport 8006 --enable 1
+    --source {{ item }} --comment {{ pve_firewall_comment_prefix }}-gui
+  loop: "{{ pve_firewall_mgmt_subnets }}"
+  when: >
+    not (_fw_rules2.stdout | from_json
+         | selectattr('source', 'defined')
+         | selectattr('source', 'equalto', item)
+         | selectattr('dport', 'defined')
+         | selectattr('dport', 'equalto', '8006')
+         | selectattr('enable', 'defined')
+         | selectattr('enable', 'equalto', 1)
+         | list | length > 0)
+  loop_control:
+    label: "{{ item }}"
+
+- name: SSH allow rule ({{ pve_firewall_ssh_port }}) (§ 1.2.4)
+  ansible.builtin.command: >-
+    pvesh create /cluster/firewall/rules
+    --type in --action ACCEPT --proto tcp --dport {{ pve_firewall_ssh_port }}
+    --enable 1 --source {{ item }} --comment {{ pve_firewall_comment_prefix }}-ssh
+  loop: "{{ pve_firewall_mgmt_subnets }}"
+  when: >
+    not (_fw_rules2.stdout | from_json
+         | selectattr('source', 'defined')
+         | selectattr('source', 'equalto', item)
+         | selectattr('dport', 'defined')
+         | selectattr('dport', 'equalto', pve_firewall_ssh_port | string)
+         | selectattr('enable', 'defined')
+         | selectattr('enable', 'equalto', 1)
+         | list | length > 0)
+  loop_control:
+    label: "{{ item }}"
+
+- name: Enable the datacenter firewall + policies (§ 1.2.4)
+  ansible.builtin.command: >-
+    pvesh set /cluster/firewall/options
+    --enable 1 --policy_in DROP --policy_out ACCEPT
+
+# corosync (cluster formation, migrations) + Ceph (mon/osd/mgr)
+- name: Cluster rules — corosync + Ceph (udp 5405-5412, tcp 3300/6789/6800-7300)
+  when: pve_firewall_cluster_services | bool
+  block:
+    - name: Corosync UDP 5405-5412 from the cluster network
+      ansible.builtin.command: >-
+        pvesh create /cluster/firewall/rules
+        --type in --action ACCEPT --proto udp --dport 5405:5412
+        --enable 1 --source {{ pve_firewall_cluster_net }}
+        --comment {{ pve_firewall_comment_prefix }}-corosync
+      failed_when: false
+      when: >-
+        not (_fw_rules2.stdout | from_json
+             | selectattr('comment', 'defined')
+             | selectattr('comment', 'equalto', pve_firewall_comment_prefix + '-corosync')
+             | selectattr('enable', 'defined')
+             | selectattr('enable', 'equalto', 1)
+             | list | length > 0)
+
+    - name: Ceph — mon 3300 + 6789, osd/mgr 6800-7300 (tcp) from the cluster network
+      ansible.builtin.command: >-
+        pvesh create /cluster/firewall/rules
+        --type in --action ACCEPT --proto tcp --dport {{ item }}
+        --enable 1 --source {{ pve_firewall_cluster_net }}
+        --comment {{ pve_firewall_comment_prefix }}-ceph
+      loop: ["3300", "6789", "6800:7300"]
+      when: >-
+        not (_fw_rules2.stdout | from_json
+             | selectattr('comment', 'defined')
+             | selectattr('comment', 'equalto', pve_firewall_comment_prefix + '-ceph')
+             | selectattr('dport', 'defined')
+             | selectattr('dport', 'equalto', item)
+             | selectattr('enable', 'defined')
+             | selectattr('enable', 'equalto', 1)
+             | list | length > 0)
+      loop_control:
+        label: "tcp/{{ item }}"
+
+- name: FORWARD DROP policy (§ 1.2.5 — Level 2, nftables tech preview)
+  when: pve_firewall_forward_drop | bool
+  ansible.builtin.command: pvesh set /cluster/firewall/options --policy_forward DROP
+  register: _fw_fwd
+  failed_when: false
+
+- name: Warn if FORWARD DROP was rejected by the API (legacy iptables backend)
+  ansible.builtin.debug:
+    msg: "FORWARD DROP not applied ({{ _fw_fwd.stderr | default('n/a') }}) — § 1.2.5 requires the nftables backend (tech preview)."
+  when: pve_firewall_forward_drop | bool and _fw_fwd.rc is defined and _fw_fwd.rc != 0
+
+- name: Check that the firewall is active
+  ansible.builtin.command: pvesh get /cluster/firewall/options --output-format json
+  register: _fw_opts
+  changed_when: false
+  failed_when: (_fw_opts.stdout | from_json).enable | default(0) | int != 1

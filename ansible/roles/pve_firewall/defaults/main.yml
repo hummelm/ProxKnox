@@ -1,0 +1,22 @@
+---
+# pve_firewall — HSE PVE9 Hardening Guide § 1.2.4 (+ optional § 1.2.5)
+# Enables the PVE (datacenter) firewall with an allow-list for 8006/SSH from
+# trusted subnets only, INPUT DROP by default.
+# WARNING: locking yourself out is the classic incident — verify the subnets
+# below before enabling (pve_hardening_firewall: true in group_vars).
+
+# Allowed administration subnets (GUI 8006 + SSH)
+pve_firewall_mgmt_subnets:
+  - 192.168.122.0/24   # libvirt host (NAT) — Ansible controller
+  - 192.168.200.0/24   # lab PXE segment
+# Node SSH port (lab: 2222)
+pve_firewall_ssh_port: 2222
+# § 1.2.5 (Level 2, nftables tech preview):
+pve_firewall_forward_drop: false
+# Cluster services: corosync (udp 5405-5412) + Ceph (mon 3300/6789,
+# osd/mgr 6800-7300) — enable when the node is part of a cluster
+# and/or hosts Ceph (otherwise the PVE firewall breaks cluster formation/migration)
+pve_firewall_cluster_services: false
+pve_firewall_cluster_net: "192.168.200.0/24"
+# Marker for rules created by this role (idempotency)
+pve_firewall_comment_prefix: hse-124

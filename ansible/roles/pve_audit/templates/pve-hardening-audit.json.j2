@@ -1,0 +1,36 @@
+{% set ns = namespace(pass=0, fail=0, skip=0) %}
+{% for r in pve_audit_results %}
+{%- if r.skipped | default(False) | bool %}{% set ns.skip = ns.skip + 1 %}
+{%- elif r.status_ok | bool %}{% set ns.pass = ns.pass + 1 %}
+{%- else %}{% set ns.fail = ns.fail + 1 %}{% endif %}
+{%- endfor %}
+{
+  "audit-type": "pve-hardening",
+  "guide": "HomeSecExplorer Proxmox VE 9 Hardening Guide v0.9.2 + Ceph hardening (HSE § 3.3-3.5, E-NO, Red Hat Ceph 8)",
+  "node": "{{ inventory_hostname }}",
+  "pve-version": {{ pve_audit_pveversion.stdout | default('') | to_json }},
+  "date": "{{ ansible_date_time.iso8601 }}",
+  "epoch": {{ ansible_date_time.epoch }},
+  "summary": {
+    "test-count": {{ pve_audit_results | length }},
+    "failed-count": {{ ns.fail }},
+    "skipped-count": {{ ns.skip }},
+    "passed-count": {{ ns.pass }},
+    "summary-line": "Count: {{ pve_audit_results | length }}, Failed: {{ ns.fail }}, Skipped: {{ ns.skip }}"
+  },
+  "results": [
+  {%- for r in pve_audit_results %}
+    {
+      "id": {{ r.id | to_json }},
+      "section": {{ r.section | to_json }},
+      "title": {{ r.title | to_json }},
+      "guide": {{ r.guide | to_json }},
+      "successful": {{ 'true' if (r.status_ok | bool) else 'false' }},
+      "skipped": {{ 'true' if (r.skipped | default(False) | bool) else 'false' }},
+      "status": {{ ('skip' if (r.skipped | default(False) | bool) else ('pass' if (r.status_ok | bool) else 'fail')) | to_json }},
+      "reason": {{ r.reason | default('') | to_json }},
+      "detail": {{ r.detail | default('') | to_json }}
+    }{{ "," if not loop.last }}
+  {%- endfor %}
+  ]
+}

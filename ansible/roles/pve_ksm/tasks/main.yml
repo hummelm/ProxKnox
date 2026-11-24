@@ -1,0 +1,41 @@
+---
+- name: Stop and disable ksmtuned (tolerant if the unit is absent)
+  ansible.builtin.command: systemctl disable --now ksmtuned
+  register: _ksm_ksmtuned
+  failed_when:
+    - _ksm_ksmtuned.rc != 0
+    - "'not found' not in _ksm_ksmtuned.stdout and 'not found' not in _ksm_ksmtuned.stderr"
+    - "'does not exist' not in _ksm_ksmtuned.stdout and 'does not exist' not in _ksm_ksmtuned.stderr"
+    - "'not loaded' not in _ksm_ksmtuned.stdout and 'not loaded' not in _ksm_ksmtuned.stderr"
+  changed_when: _ksm_ksmtuned.rc == 0
+
+- name: Stop and disable ksm (tolerant if the unit is absent)
+  ansible.builtin.command: systemctl disable --now ksm
+  register: _ksm_svc
+  failed_when:
+    - _ksm_svc.rc != 0
+    - "'not found' not in _ksm_svc.stdout and 'not found' not in _ksm_svc.stderr"
+    - "'does not exist' not in _ksm_svc.stdout and 'does not exist' not in _ksm_svc.stderr"
+    - "'not loaded' not in _ksm_svc.stdout and 'not loaded' not in _ksm_svc.stderr"
+  changed_when: _ksm_svc.rc == 0
+
+- name: Read the KSM state (/sys/kernel/mm/ksm/run)
+  ansible.builtin.command: cat /sys/kernel/mm/ksm/run
+  register: _ksm_run_check
+  changed_when: false
+
+- name: Stop KSM page merging immediately (run=0, § 1.2.6)
+  ansible.builtin.shell: echo 0 > /sys/kernel/mm/ksm/run
+  when: _ksm_run_check.stdout != '0'
+
+- name: Forbid KSM per VM (--allow-ksm 0, § 1.2.6)
+  ansible.builtin.command: "qm set {{ item }} --allow-ksm 0"
+  register: _ksm_vm
+  loop: "{{ pve_ksm_disable_vmids }}"
+  changed_when: "'update' in _ksm_vm.stdout"
+
+- name: KSM state as observed
+  ansible.builtin.command: cat /sys/kernel/mm/ksm/run
+  register: _ksm_run
+  changed_when: false
+  failed_when: _ksm_run.stdout != '0'

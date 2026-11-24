@@ -1,0 +1,42 @@
+---
+- name: "Ansible Lockdown DEBIAN13-CIS — Level 2 server on Proxmox VE 9.2"
+  hosts: pve_nodes
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Verify the target is actually Proxmox VE 9.x
+      ansible.builtin.command: pveversion
+      changed_when: false
+      register: _pve_version
+      failed_when: "'9.' not in _pve_version.stdout"
+
+    - name: Show target
+      ansible.builtin.debug:
+        msg: "CIS L2 hardening (Lockdown) on {{ inventory_hostname }} — {{ _pve_version.stdout }}"
+
+  roles:
+    - role: ansible-lockdown.DEBIAN13-CIS
+      tags: [hardening, lockdown]
+
+  post_tasks:
+    - name: "PVE: purge ufw (CIS section 4 is disabled — the PVE firewall takes precedence, HSE guide § 1.1.1)"
+      when: not deb13cis_section4
+      block:
+        - name: Is ufw installed?
+          ansible.builtin.command: dpkg -s ufw
+          register: _ufw
+          changed_when: false
+          failed_when: false
+
+        - name: Disable and purge ufw
+          when: _ufw.rc is defined and _ufw.rc == 0
+          ansible.builtin.shell: |
+            ufw --force disable || true
+            apt-get -y -qq purge ufw
+          args: { executable: /bin/bash }
+
+    - name: syver audit summary (pre/post remediation)
+      ansible.builtin.debug:
+        msg: "{{ audit_results | default('Audit not run (run_audit: false)') }}"
+      tags: [hardening, lockdown]

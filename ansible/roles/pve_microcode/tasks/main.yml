@@ -1,0 +1,47 @@
+---
+# Unmanaged roles: debian_version is provided by standard facts.
+- name: Detect the CPU vendor
+  ansible.builtin.command: grep -m1 -o 'AuthenticAMD\|GenuineIntel' /proc/cpuinfo
+  register: _cpu_vendor
+  changed_when: false
+  failed_when: _cpu_vendor.stdout not in ['GenuineIntel', 'AuthenticAMD']
+
+- name: Set the microcode package according to the CPU
+  ansible.builtin.set_fact:
+    pve_microcode_package: "{{ 'intel-microcode' if _cpu_vendor.stdout == 'GenuineIntel' else 'amd64-microcode' }}"
+
+- name: Test microcode availability in the current repositories
+  ansible.builtin.command: "apt-cache policy {{ pve_microcode_package }}"
+  register: _microcode_policy
+  changed_when: false
+
+- name: Add the non-free-firmware repository (deb822) if the microcode is unavailable
+  when:
+    - pve_microcode_add_nonfree_firmware | bool
+    - "'Candidate:' not in _microcode_policy.stdout"
+  block:
+    - name: Deploy the non-free-firmware sources file
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/proxknox-nonfree-firmware.sources
+        content: |
+          Types: deb
+          URIs: {{ pve_microcode_debian_mirror }}
+          Suites: {{ ansible_distribution_release }} {{ ansible_distribution_release }}-updates
+          Components: non-free-firmware
+          Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+        mode: "0644"
+      register: _nonfree_sources
+    - name: apt update
+      ansible.builtin.apt:
+        update_cache: true
+      when: _nonfree_sources is changed
+
+- name: Install the CPU microcode ({{ pve_microcode_package }})
+  ansible.builtin.apt:
+    name: "{{ pve_microcode_package }}"
+    state: present
+
+- name: Reminder — the microcode is loaded at boot
+  ansible.builtin.debug:
+    msg: "Microcode {{ pve_microcode_package }} installed — a reboot will apply it (§ 1.1.8)."
+  changed_when: false

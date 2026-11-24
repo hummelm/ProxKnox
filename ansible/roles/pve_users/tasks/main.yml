@@ -1,0 +1,55 @@
+---
+- name: List the PVE users
+  ansible.builtin.command: pvesh get /access/users --output-format json
+  register: _pve_users
+  changed_when: false
+
+- name: Create the missing custom accounts (§ 2.1.1)
+  ansible.builtin.command: >-
+    pvesh create /access/users --userid {{ item.userid }}
+    --comment "{{ item.comment | default('') }}"
+  loop: "{{ pve_users }}"
+  when: item.userid is not in (_pve_users.stdout | from_json | map(attribute='userid'))
+  register: _users_created
+
+- name: List the PVE ACLs
+  ansible.builtin.command: pvesh get /access/acl --output-format json
+  register: _pve_acl
+  changed_when: false
+
+- name: Apply least-privilege ACLs (§ 2.1.2)
+  ansible.builtin.command: >-
+    pvesh set /access/acl --path {{ item.path | default('/') }}
+    --users {{ item.userid }} --roles {{ item.role | default('PVEAdmin') }}
+  loop: "{{ pve_users }}"
+  register: _acl_set
+  # set /access/acl is idempotent on the PVE side (upsert): only real
+  # creations reported above are counted as changes.
+  changed_when: false
+
+- name: Require 2FA on the pam realm (§ 2.1.3)
+  when: pve_users_require_2fa | bool
+  block:
+    - name: Read the pam realm configuration
+      ansible.builtin.command: pvesh get /access/domains/pam --output-format json
+      register: _pam_realm
+      changed_when: false
+    - name: Enable TOTP if absent
+      ansible.builtin.command: pvesh set /access/domains/pam --tfa type=oath
+      when: _pam_realm.stdout | from_json | selectattr('tfa', 'defined') | list | length == 0
+      failed_when: false
+      register: _tfa_set
+    - name: Warn if the command was rejected
+      ansible.builtin.debug:
+        msg: "Warning: pam 2FA not enabled ({{ _tfa_set.stderr | default('n/a') }}) — check manually."
+      when: _tfa_set is changed and _tfa_set.rc is defined and _tfa_set.rc != 0
+
+- name: Create the missing API tokens (§ 2.2.1, § 2.2.4)
+  ansible.builtin.command: >-
+    pvesh create /access/users/{{ item.userid }}/token/{{ item.tokenid }}
+    --expire {{ item.expire | default(0) }} --comment "{{ item.comment | default('automation') }}"
+  loop: "{{ pve_api_tokens }}"
+  register: _token_create
+  failed_when:
+    - _token_create.rc != 0
+    - "'already exists' not in _token_create.stderr"

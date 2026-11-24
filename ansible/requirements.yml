@@ -1,0 +1,13 @@
+---
+collections:
+  - name: community.general
+    # <12: versions >=12 remove the `yaml` callback used by ansible.cfg
+    # (stdout_callback). Otherwise, force ANSIBLE_STDOUT_CALLBACK=default
+    version: ">=9.0.0,<12.0.0"
+  - name: community.crypto
+  - name: ansible.posix
+
+roles:
+  - name: ansible-lockdown.DEBIAN13-CIS
+    src: https://github.com/ansible-lockdown/DEBIAN13-CIS.git
+    version: 1.1.0

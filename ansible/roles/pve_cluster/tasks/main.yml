@@ -1,0 +1,39 @@
+---
+- name: Detect the presence of a cluster
+  ansible.builtin.stat:
+    path: "{{ pve_cluster_corosync_conf }}"
+  register: _corosync
+
+- name: No cluster (standalone node) — control does not apply
+  ansible.builtin.debug:
+    msg: "Standalone node: /etc/pve/corosync.conf absent — § 3.x not applicable."
+  when: not _corosync.stat.exists
+
+- name: Corosync cluster checks
+  when: _corosync.stat.exists
+  block:
+    - name: "Check secauth (§ 3.2 — default: on)"
+      ansible.builtin.command: grep -E '^\s*secauth:' {{ pve_cluster_corosync_conf }}
+      register: _secauth
+      changed_when: false
+      failed_when: false
+
+    - name: "Force secauth: on if disabled"
+      ansible.builtin.replace:
+        path: "{{ pve_cluster_corosync_conf }}"
+        regexp: '^(\s*secauth:\s*)off(.*)$'
+        replace: '\g<1>on\g<2>'
+      when: "'secauth: on' not in _secauth.stdout"
+      register: _secauth_fixed
+
+    - name: Restart corosync (one node at a time in production! § 3.2)
+      ansible.builtin.systemd:
+        name: corosync
+        state: restarted
+      when: _secauth_fixed is changed
+
+    - name: Corosync dual-ring reminder (§ 3.1)
+      ansible.builtin.debug:
+        msg: >
+          § 3.1: document ring0/ring1 on two dedicated interfaces/VLANs —
+          topology-dependent, not automatable here.

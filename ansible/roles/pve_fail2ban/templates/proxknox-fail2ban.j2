@@ -1,0 +1,19 @@
+# Fail2ban — ProxKnox (HSE PVE9 Hardening Guide § 2.3.3)
+[sshd]
+backend = systemd
+enabled = true
+port = {{ pve_fail2ban_sshd_port }}
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = {{ pve_fail2ban_maxretry }}
+findtime = {{ pve_fail2ban_findtime }}
+bantime = {{ pve_fail2ban_bantime }}
+
+[proxmox]
+enabled = true
+port = 8006
+filter = proxmox
+backend = systemd
+maxretry = {{ pve_fail2ban_maxretry }}
+findtime = {{ pve_fail2ban_findtime }}
+bantime = {{ pve_fail2ban_bantime }}

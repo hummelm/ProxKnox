@@ -1,0 +1,10 @@
+# Centralized forwarding of Proxmox logs (HSE PVE9 guide § 5.1.1)
+if ($programname startswith "pve" or $programname startswith "pm" or $programname startswith "pvedaemon" or $programname startswith "pveproxy") then {
+    action(type="omfwd"
+           target="{{ pve_logging_remote_host }}"
+           port="{{ pve_logging_remote_port }}"
+           protocol="{{ pve_logging_remote_protocol }}"
+           action.resumeRetryCount="10"
+           queue.type="linkedList"
+           queue.size="10000")
+}

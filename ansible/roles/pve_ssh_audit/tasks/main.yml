@@ -1,0 +1,63 @@
+---
+- name: "PVE DEVIATION — remove DisableForwarding (CIS 5.1.8): breaks live migration"
+  # PVE live migration (qm migrate --online) uses an SSH streamlocal port
+  # forward to /run/qemu-server/<vmid>.migrate. DisableForwarding=yes
+  # (set by CIS 5.1.8 on an already remediated node) rejects this forward on
+  # the destination side ("ram_save_setup failed: Input/output Error").
+  # The rest of the ssh-audit profile remains active (hardened KEX/Ciphers/MACs).
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^(?i)\s*DisableForwarding\s+yes\s*$'
+    state: absent
+  register: _sshaudit_nofwd
+
+- name: sshd drop-in — ssh-audit profile (§ 1.1.4)
+  ansible.builtin.copy:
+    dest: "{{ pve_ssh_audit_dropin }}"
+    mode: "0644"
+    content: |
+      # Debian 13 ssh-audit profile — HSE PVE9 Hardening Guide § 1.1.4
+      # (KEX: sntrup761 hybrid — mlkem768x25519 only exists in OpenSSH 10+)
+      KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org
+      Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+      MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+      HostKeyAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+  register: _sshaudit_cfg
+
+- name: Validate the sshd configuration before reloading
+  ansible.builtin.command: sshd -t
+  changed_when: false
+  failed_when: false
+  register: _sshd_t
+
+- name: Remove the invalid drop-in (sshd -t failed — do not break sshd at boot)
+  ansible.builtin.file:
+    path: "{{ pve_ssh_audit_dropin }}"
+    state: absent
+  when: _sshd_t.rc != 0
+
+- name: Fail on an invalid drop-in (sshd -t)
+  ansible.builtin.fail:
+    msg: "sshd -t fails with the ssh-audit profile: {{ _sshd_t.stderr }} — drop-in removed, adjust the role."
+  when: _sshd_t.rc != 0
+
+- name: Reload sshd if the configuration changed
+  ansible.builtin.systemd:
+    name: ssh
+    state: reloaded
+  when: _sshaudit_cfg is changed or _sshaudit_nofwd is changed
+
+- name: SSH client config — RSA cluster peers (§ 1.1.4)
+  ansible.builtin.blockinfile:
+    path: /root/.ssh/config
+    create: true
+    mode: "0600"
+    marker: "# {mark} ANSIBLE MANAGED — pve_ssh_audit (HSE § 1.1.4)"
+    block: |
+      # === Cluster peers: RSA host keys (keys stored in /etc/pve/nodes/*) ===
+      # User keys: the PVE cluster key (pvecm --use_ssh) is ed25519,
+      # so it is allowed in addition to RSA (otherwise the SSH client rejects live migration).
+      Host {{ pve_ssh_audit_cluster_hosts }}
+          HostKeyAlgorithms rsa-sha2-512,rsa-sha2-256
+          PubkeyAcceptedAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+  register: _ssh_client_cfg

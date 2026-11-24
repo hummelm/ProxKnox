@@ -1,0 +1,112 @@
+---
+# pve_ceph — Ceph hardening (HSE PVE9 § 3.3-3.5, E-NO, Red Hat Ceph 8).
+# Clean no-op when Ceph is not deployed (single-node lab: nominal case).
+
+- name: Detect Ceph on this node (pmxcfs config or /etc/ceph, running daemons)
+  ansible.builtin.shell: |
+    set -o pipefail
+    conf=""
+    for f in /etc/pve/ceph.conf /etc/ceph/ceph.conf; do
+      [ -f "$f" ] && conf="$f" && break
+    done
+    dmn="$(systemctl list-units --type=service --state=running \
+           --no-legend 'ceph-*' 2>/dev/null | wc -l)"
+    echo "configured=$([ -n "$conf" ] && echo 1 || echo 0) daemons=$dmn path=$conf"
+  args:
+    executable: /bin/bash
+  register: _ceph_detect
+  changed_when: false
+  failed_when: false
+
+- name: Interpret the Ceph detection
+  ansible.builtin.set_fact:
+    pve_ceph_configured: >-
+      {{ (_ceph_detect.stdout | regex_replace('.*configured=(\d+).*', '\1')) == '1' }}
+    pve_ceph_daemons_running: >-
+      {{ (_ceph_detect.stdout | regex_replace('.*daemons=(\d+).*', '\1')) | int > 0 }}
+    pve_ceph_conf_path: >-
+      {{ (_ceph_detect.stdout | regex_replace('.*path=(\S*).*', '\1')) }}
+
+- name: Ceph absent — check that no leftover daemon runs (reduced attack surface)
+  ansible.builtin.command: systemctl list-units --type=service --state=running --no-legend 'ceph-*'
+  register: _ceph_residual
+  changed_when: false
+  failed_when: false
+  when: not (pve_ceph_configured | bool)
+
+- name: Ceph absent — leftover daemons are forbidden
+  ansible.builtin.assert:
+    that: _ceph_residual.stdout_lines | default([]) | length == 0
+    fail_msg: >-
+      Active ceph-* daemons without a valid Ceph configuration ({{ _ceph_residual.stdout_lines }})
+      — investigate before hardening.
+    success_msg: "Ceph not deployed: no leftover ceph-* daemon (reduced attack surface)."
+  when: not (pve_ceph_configured | bool)
+
+- name: Ceph hardening block (when Ceph is deployed)
+  when: pve_ceph_configured | bool
+  block:
+
+    - name: § 3.5 — Messenger v2 encryption + mandatory cephx (ceph.conf)
+      ansible.builtin.blockinfile:
+        path: "{{ pve_ceph_conf_path }}"
+        marker: "# {mark} ANSIBLE MANAGED — ProxKnox pve_ceph (HSE § 3.5)"
+        insertafter: '^\[global\]'
+        block: |
+          # --- HSE PVE9 § 3.5 (Level 2): encrypted messenger, cephx required ---
+          auth_client_required = {{ pve_ceph_auth_required }}
+          auth_cluster_required = {{ pve_ceph_auth_required }}
+          auth_service_required = {{ pve_ceph_auth_required }}
+          ms_bind_msgr2 = {{ 'true' if pve_ceph_ms_bind_msgr2 else 'false' }}
+          ms_encrypt = {{ 'true' if pve_ceph_ms_encrypt else 'false' }}
+          ms_cluster_mode = {{ pve_ceph_ms_cluster_mode }}
+          ms_service_mode = {{ pve_ceph_ms_service_mode }}
+          ms_client_mode = {{ pve_ceph_ms_client_mode }}
+          ms_mon_client_mode = {{ pve_ceph_ms_mon_client_mode }}
+          ms_mon_cluster_mode = {{ pve_ceph_ms_mon_cluster_mode }}
+          ms_mon_service_mode = {{ pve_ceph_ms_mon_service_mode }}
+      register: _ceph_conf
+
+    - name: E-NO/RH — forbid unauthenticated global ID reclaim (online cluster)
+      ansible.builtin.command: >
+        ceph config set mon auth_allow_insecure_global_id_reclaim
+        {{ 'false' if pve_ceph_disable_insecure_global_id_reclaim else 'true' }}
+      register: _ceph_gid
+      changed_when: false
+      failed_when: false
+      when: pve_ceph_daemons_running | bool
+
+    - name: E-NO — locate the Ceph keyrings on the node
+      ansible.builtin.shell: |
+        # NB: /etc/pve/priv lives in pmxcfs (root:root 0700 by design,
+        # chgrp impossible) — only keyrings on the real FS are handled.
+        find /etc/ceph -maxdepth 2 -name '*.keyring' 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: _ceph_keyring_find
+      changed_when: false
+
+    - name: E-NO — Ceph keyrings inaccessible to non-root (0600 root:root)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: "0600"
+        owner: root
+        group: root
+      loop: "{{ _ceph_keyring_find.stdout_lines }}"
+      register: _ceph_keyrings
+
+    - name: § 3.5 — restart the Ceph daemons if the config changed
+      ansible.builtin.systemd:
+        name: ceph.target
+        state: restarted
+      when:
+        - pve_ceph_daemons_running | bool
+        - _ceph_conf is changed
+
+    - name: Ceph reminders that cannot be automated (design decisions)
+      ansible.builtin.debug:
+        msg:
+          - "§ 3.3: size={{ pve_ceph_pool_size }}/min_size={{ pve_ceph_pool_min_size }} and CRUSH failure domains: to be defined AT POOL CREATION."
+          - "§ 3.4: OSD encryption (LUKS): tick \"Encryption\" at each OSD's creation — not retroactive."
+          - "E-NO: least-privilege cephx caps per client (ceph auth caps) + identifier rotation."
+          - "E-NO: restrict ports 3300/6789/6800-7300 to the cluster/storage networks (PVE firewall)."

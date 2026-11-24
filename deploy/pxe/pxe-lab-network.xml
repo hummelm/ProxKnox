@@ -1,0 +1,9 @@
+<!-- Isolated PXE lab network: deliberately WITHOUT an <ip> element and WITHOUT <dhcp>.
+     libvirt therefore attaches neither a host IP nor dnsmasq to this bridge: it is
+     the pxe-server VM that provides DHCP + TFTP + DNS (dnsmasq), HTTP (apache2) and
+     the NAT gateway of the 192.168.200.0/24 segment (libvirt network "pxe-lab", cf. deploy/pxe_deploy_container.py).
+     Used by deploy/pxe_deploy_container.py (virsh net-define/start/autostart). -->
+<network>
+  <name>pxe-lab</name>
+  <bridge name='pxebr0' stp='on' delay='0'/>
+</network>

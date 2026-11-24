@@ -1,0 +1,267 @@
+---
+# e2e-cluster.yml — ProxKnox "3-node lab cluster" E2E procedure
+#
+# Phases enableable via --tags (driven by tools/e2e-cluster-test.sh):
+#   net      : hostname proxknox-node{1,2,3}, /etc/hosts, STATIC vmbr0
+#              192.168.200.11/12/13 (gw .2) — replaces the volatile DHCP of
+#              the PXE segment; serial:1 + reboot PER NODE.
+#              ⚠ After "net": update ansible/inventory/hosts.yml (IPs
+#              .11/.12/.13) BEFORE the following phases (the script does it).
+#   cluster  : cluster formation SSH key (controller → nodes) + pvecm create
+#              on node1 + pvecm add on node2/3 (3-vote quorum).
+#   ceph     : pveceph init (node1) + 1 OSD per node (2nd virtio disk) +
+#              "vmstorage" pool (size 3/min_size 2, HSE § 3.3) + storage.cfg.
+#
+# Static lab mapping (single view for /etc/hosts and corosync):
+#   pxe-client → proxknox-node1 → 192.168.200.11
+#   pxe-node2  → proxknox-node2 → 192.168.200.12
+#   pxe-node3  → proxknox-node3 → 192.168.200.13
+
+- name: "E2E — 1. Nodes: hostname + static vmbr0 (serial, reboot)"
+  hosts: pve_nodes
+  become: true
+  serial: 1
+  gather_facts: false
+  tags: [net]
+  vars:
+    e2e_iface: enp1s0
+    e2e_gw: 192.168.200.2
+    e2e_static:
+      proxknox-node1: 192.168.200.11
+      proxknox-node2: 192.168.200.12
+      proxknox-node3: 192.168.200.13
+  tasks:
+    - name: Short node name (pxe-client→node1, pxe-nodeX→nodeX)
+      ansible.builtin.set_fact:
+        e2e_hostname: "{{ 'proxknox-node1' if inventory_hostname == 'pxe-client'
+                          else inventory_hostname | replace('pxe-', 'proxknox-') }}"
+
+    - name: Address of this node
+      ansible.builtin.set_fact:
+        e2e_ip: "{{ e2e_static[e2e_hostname] }}"
+
+    - name: hostname + /etc/hosts (all 3 nodes, static lab IPs)
+      ansible.builtin.shell: |
+        set -e
+        hostnamectl set-hostname {{ e2e_hostname }}
+        sed -i '/^127\.0\.1\.1/d' /etc/hosts
+        grep -q '{{ item.name }} ' /etc/hosts || echo '{{ item.ip }} {{ item.name }} {{ item.name }}.lab' >> /etc/hosts
+      args:
+        executable: /bin/bash
+      loop: "{{ e2e_static | dict2items(key_name='name', value_name='ip') }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: true
+
+    - name: /etc/network/interfaces — static vmbr0 + enslaved NIC
+      ansible.builtin.copy:
+        dest: /etc/network/interfaces
+        mode: "0644"
+        content: |
+          # ProxKnox E2E — PVE bridge + static addressing (stable corosync/Ceph)
+          auto lo
+          iface lo inet loopback
+
+          auto {{ e2e_iface }}
+          iface {{ e2e_iface }} inet manual
+
+          auto vmbr0
+          iface vmbr0 inet static
+                  address {{ e2e_ip }}/24
+                  gateway {{ e2e_gw }}
+                  bridge-ports {{ e2e_iface }}
+                  bridge-stp off
+                  bridge-fd 0
+
+    - name: Reboot (new networking takes effect)
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+
+- name: "E2E — 2. Cluster formation SSH key (controller)"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [cluster]
+  vars:
+    e2e_cluster_key: /mnt/DATA/ProxKnox/libvirt-work/pxe-work/keys/cluster_key
+  tasks:
+    - name: Generate a dedicated cluster formation key (if absent)
+      ansible.builtin.command: >
+        ssh-keygen -t ed25519 -N "" -C proxknox-cluster-form -f {{ e2e_cluster_key }}
+      args:
+        creates: "{{ e2e_cluster_key }}"
+
+- name: "E2E — 3. Distribute the formation key (node1: pubkey; node2/3: privkey)"
+  hosts: pve_nodes
+  become: true
+  gather_facts: false
+  tags: [cluster]
+  vars:
+    e2e_cluster_key: /mnt/DATA/ProxKnox/libvirt-work/pxe-work/keys/cluster_key
+    e2e_node1_ip: 192.168.200.11
+  tasks:
+    - name: Authorized public key for root on this node
+      ansible.builtin.lineinfile:
+        path: /root/.ssh/authorized_keys
+        line: "{{ lookup('ansible.builtin.file', e2e_cluster_key + '.pub') }}"
+        create: true
+        mode: "0600"
+
+    - name: Private formation key on the joining nodes (2/3)
+      ansible.builtin.copy:
+        dest: /root/.ssh/id_ed25519
+        mode: "0600"
+        content: "{{ lookup('ansible.builtin.file', e2e_cluster_key) }}"
+      when: ansible_host != e2e_node1_ip
+
+    - name: known_hosts entry for node1 on the joining nodes
+      ansible.builtin.known_hosts:
+        name: "{{ e2e_node1_ip }}"
+        key: "{{ lookup('pipe', 'ssh-keyscan -t ed25519 ' + e2e_node1_ip) }}"
+        path: /root/.ssh/known_hosts
+      when: ansible_host != e2e_node1_ip
+
+- name: "E2E — 4. pvecm create (node1)"
+  hosts: pxe-client
+  become: true
+  gather_facts: false
+  tags: [cluster]
+  tasks:
+    - name: "Firewall on node1 — allow corosync BEFORE formation (the datacenter firewall is already active there)"
+      ansible.builtin.shell: |
+        pvesh get /cluster/firewall/rules --output-format json 2>/dev/null \
+          | grep -q '"dport":"5405:5412"' \
+          || pvesh create /cluster/firewall/rules \
+               --type in --action ACCEPT --proto udp --dport 5405:5412 \
+               --enable 1 --source 192.168.200.0/24 --comment e2e-corosync
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+
+    - name: Pre-existing cluster?
+      ansible.builtin.stat:
+        path: /etc/pve/corosync.conf
+      register: _corosync
+
+    - name: Create the proxknox-lab cluster (link0 = node1 static IP)
+      ansible.builtin.command: pvecm create proxknox-lab --link0 192.168.200.11
+      when: not _corosync.stat.exists
+
+    - name: Wait for quorum (1 vote expected at this stage)
+      ansible.builtin.command: pvecm status
+      register: _st1
+      changed_when: false
+      until: _st1.stdout is search('Quorum:.*1')
+      retries: 12
+      delay: 5
+
+- name: "E2E — 5. pvecm add (node2/3) then 3-vote quorum"
+  hosts: pve_nodes
+  become: true
+  serial: 1
+  gather_facts: false
+  tags: [cluster]
+  vars:
+    e2e_node1_ip: 192.168.200.11
+  tasks:
+    - name: Join the cluster (nodes 2/3)
+      ansible.builtin.command: >
+        pvecm add {{ e2e_node1_ip }} --link0 {{ ansible_host }} --use_ssh
+      when: ansible_host != e2e_node1_ip
+
+- name: "E2E — 6. Verify the 3-vote quorum (node1)"
+  hosts: pxe-client
+  become: true
+  gather_facts: false
+  tags: [cluster]
+  tasks:
+    - name: "pvecm status — Expected quorum: 3"
+      ansible.builtin.command: pvecm status
+      register: _st3
+      changed_when: false
+      until: _st3.stdout is search('Quorum:.*3')
+      retries: 12
+      delay: 5
+
+- name: "E2E — 7. Ceph — init (node1)"
+  hosts: pxe-client
+  become: true
+  gather_facts: false
+  tags: [ceph]
+  tasks:
+    - name: Ceph already initialized?
+      ansible.builtin.stat:
+        path: /etc/pve/ceph.conf
+      register: _ceph
+
+    - name: pveceph init (public network = lab segment)
+      ansible.builtin.command: pveceph init --network 192.168.200.0/24
+      when: not _ceph.stat.exists
+
+    - name: Wait for the monitor (HEALTH check reachable)
+      ansible.builtin.command: ceph -s
+      register: _cs
+      changed_when: false
+      until: _cs.rc == 0
+      retries: 20
+      delay: 10
+
+- name: "E2E — 8. Ceph — 1 OSD per node (2nd virtio disk)"
+  hosts: pve_nodes
+  become: true
+  serial: 1
+  gather_facts: false
+  tags: [ceph]
+  tasks:
+    - name: Install Ceph on this node if needed
+      ansible.builtin.shell: |
+        command -v ceph-osd >/dev/null 2>&1 || apt-get install -y --no-install-recommends ceph-osd ceph-common
+      args:
+        executable: /bin/bash
+
+    - name: Create the OSD on the dedicated disk (attempts with PVE syntaxes)
+      ansible.builtin.shell: |
+        set -e
+        osd="$(lsblk -ndo NAME,TYPE,SERIAL | awk '$2=="disk"{d="/dev/"$1} END{print d}')"
+        if [ -z "$osd" ] || [ "$osd" = "/dev/vda" ]; then
+          echo "OSD-DISK-MISSING"; exit 1
+        fi
+        if [ -b "$osd" ]; then
+          pveceph osd create "$osd" || pveceph createosd "$osd"
+        fi
+      args:
+        executable: /bin/bash
+      register: _osd
+      changed_when: _osd.rc == 0
+
+- name: "E2E — 9. Ceph — vmstorage pool + storage.cfg"
+  hosts: pxe-client
+  become: true
+  gather_facts: false
+  tags: [ceph]
+  tasks:
+    - name: RBD pool vmstorage (size 3, min_size 2 — HSE § 3.3, pg_num 32 for the lab)
+      ansible.builtin.shell: |
+        set -o pipefail
+        # NB: pveceph uses UNDERSCORES (--add_storages, --min_size, ...)
+        # and for only 3 OSDs, 32 PGs are enough — otherwise POOL_TOO_MANY_PGS
+        # (default 128 PGs) → permanent HEALTH_WARN on a 3-node lab.
+        if ! ceph osd pool ls 2>/dev/null | grep -qx vmstorage; then
+          pveceph pool create vmstorage --add_storages 1 \
+            --size 3 --min_size 2 --pg_num 32
+        fi
+        grep -q 'rbd: vmstorage' /etc/pve/storage.cfg \
+          || echo "STORAGE-ENTRY-MISSING"
+      args:
+        executable: /bin/bash
+      register: _pool
+      changed_when: "'STORAGE-ENTRY-MISSING' not in _pool.stdout"
+
+    - name: Wait for HEALTH_OK before the tests
+      ansible.builtin.command: ceph -s --format json
+      register: _chs
+      changed_when: false
+      until: (_chs.stdout | from_json).health.status == 'HEALTH_OK'
+      retries: 30
+      delay: 10

@@ -1,0 +1,8 @@
+---
+# pve_ksm — HSE PVE9 Hardening Guide § 1.2.6
+# KSM (Kernel Samepage Merging) disabled: possible cross-VM side-channel
+# attack in multi-tenant environments. For a trusted single-tenant setup,
+# set pve_hardening_ksm to false in group_vars.
+
+# VMs for which "Allow KSM" is forced to false (qm set <id> --allow-ksm 0)
+pve_ksm_disable_vmids: []

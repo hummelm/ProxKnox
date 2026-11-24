@@ -1,0 +1,9 @@
+---
+all:
+  children:
+    pve_nodes:
+      hosts:
+        proxknox-lab:
+          ansible_host: 192.168.122.50
+          ansible_user: adminlab
+          ansible_become: true

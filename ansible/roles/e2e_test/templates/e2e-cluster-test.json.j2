@@ -1,0 +1,33 @@
+{% set ns = namespace(pass=0, fail=0, notrun=0) %}
+{% for r in e2e_results %}
+{%- if not (r.ran | default(true) | bool) %}{% set ns.notrun = ns.notrun + 1 %}
+{%- elif r.ok | bool %}{% set ns.pass = ns.pass + 1 %}
+{%- else %}{% set ns.fail = ns.fail + 1 %}{% endif %}
+{%- endfor %}
+{
+  "test-suite": "e2e-cluster-proxknox",
+  "scenario": "3-node Proxmox VE 9.2 lab cluster: PXE deployment, corosync cluster, Ceph (1 OSD/node), mini VM 1 vCPU/2 GB on RBD, live migrations with downtime measurement",
+  "node": "{{ inventory_hostname }}",
+  "lab-nodes": ["proxknox-node1 (pxe-client)", "proxknox-node2 (pxe-node2)", "proxknox-node3 (pxe-node3)"],
+  "date": "{{ ansible_date_time.iso8601 }}",
+  "epoch": {{ ansible_date_time.epoch }},
+  "summary": {
+    "test-count": {{ e2e_results | length }},
+    "passed-count": {{ ns.pass }},
+    "failed-count": {{ ns.fail }},
+    "notrun-count": {{ ns.notrun }},
+    "summary-line": "Count: {{ e2e_results | length }}, Failed: {{ ns.fail }}, NotRun: {{ ns.notrun }}"
+  },
+  "results": [
+  {%- for r in e2e_results %}
+    {
+      "id": {{ r.id | to_json }},
+      "phase": {{ r.phase | to_json }},
+      "title": {{ r.title | to_json }},
+      "expect": {{ r.expect | to_json }},
+      "status": {{ ('notrun' if not (r.ran | default(true) | bool) else ('pass' if (r.ok | bool) else 'fail')) | to_json }},
+      "got": {{ r.got | default('') | string | to_json }}
+    }{{ "," if not loop.last }}
+  {%- endfor %}
+  ]
+}

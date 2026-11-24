@@ -1,0 +1,12 @@
+---
+# pve_ssh_audit — HSE PVE9 Hardening Guide § 1.1.4 (Level 2)
+# Tightened sshd profile (modern KEX/Cipher/MAC) + SSH client config
+# "RSA cluster peers" (PVE host keys are RSA — avoids warnings that would
+# break internal live migration).
+# Optional role: kept false by default because it restricts the accepted
+# algorithms (test cluster/console access before rolling out).
+
+# Cluster peers pattern for the SSH client config (§ 1.1.4)
+pve_ssh_audit_cluster_hosts: "pve* *.cluster.local 192.168.122.* 192.168.200.*"
+# sshd drop-in path (Debian 13 reads /etc/ssh/sshd_config.d/*.conf)
+pve_ssh_audit_dropin: /etc/ssh/sshd_config.d/60-hse-sshaudit.conf

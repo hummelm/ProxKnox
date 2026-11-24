@@ -1,0 +1,4 @@
+---
+# pve_rkhunter — HSE PVE9 Hardening Guide § 5.3.2
+# Rootkit detection with a daily check via cron.daily.
+pve_rkhunter_cron_file: /etc/cron.daily/rkhunter-check

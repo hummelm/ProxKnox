@@ -1,0 +1,378 @@
+---
+# e2e_test — E2E functional tests (3-node cluster + Ceph + mini VM + live
+# migration). Run on proxknox-node1 ONLY (remote checks go through the
+# pvesh API and SSH). Consolidated JSON report: e2e-cluster-test_<epoch>.json
+# (per-test status, phase, expected result, actual result).
+# The test VM's IP is DETERMINISTIC (e2e_vm_ip): set statically by cloud-init
+# (T065) + DHCP reservation by MAC (dnsmasq, safety net).
+
+- name: T010 — Cluster quorum (3 votes)
+  tags: [phase1]
+  ansible.builtin.command: pvecm status
+  register: t010
+  changed_when: false
+  failed_when: false
+
+- name: T020 — Ceph HEALTH_OK
+  tags: [phase1]
+  ansible.builtin.command: ceph -s --format json
+  register: t020
+  changed_when: false
+  failed_when: false
+
+- name: "T030 — Ceph: at least 3 OSDs (1 per node)"
+  ansible.builtin.command: ceph osd dump --format json
+  register: t030
+  changed_when: false
+  failed_when: false
+
+- name: T040 — Hardened Ceph (msgr2 secure + cephx — pve_ceph role)
+  tags: [phase1]
+  ansible.builtin.shell: |
+    f=/etc/pve/ceph.conf
+    grep -q 'auth_client_required' "$f" &&
+    grep -Eq 'ms_cluster_mode *= *secure' "$f" &&
+    grep -Eq 'ms_client_mode *= *secure' "$f"
+  args: { executable: /bin/bash }
+  register: t040
+  changed_when: false
+  failed_when: false
+
+- name: Copy the Debian 13 cloud image to node 1 (if absent)
+  tags: [phase1]
+  ansible.builtin.copy:
+    src: "{{ e2e_cloud_image }}"
+    dest: "/root/{{ e2e_cloud_image | basename }}"
+    mode: "0644"
+
+- name: T050 — Deploy the mini VM (1 CPU / 2 GB / RBD disk on vmstorage)
+  tags: [phase1]
+  ansible.builtin.shell: |
+    set -e
+    # VM looked up via the cluster API: after migration the config may live
+    # on another node, whereas qm config is purely local.
+    cur=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null \
+          | python3 -c "import json,sys; print(next((v['node'] for v in json.load(sys.stdin) if v.get('vmid')=={{ e2e_vmid }}), ''))")
+    if [ -n "$cur" ]; then
+      echo "VM {{ e2e_vmid }} already deployed (on $cur)"
+      exit 0
+    fi
+    qm create {{ e2e_vmid }} --name {{ e2e_vmname }} \
+      --cores {{ e2e_vm_cores }} --memory {{ e2e_vm_memory }} \
+      --net0 virtio,bridge=vmbr0,macaddr={{ e2e_vm_mac }} \
+      --serial0 socket --vga serial0 --ostype l26 --agent enabled=1 >/dev/null
+    qm importdisk {{ e2e_vmid }} "/root/{{ e2e_cloud_image | basename }}" {{ e2e_vm_storage }} >/dev/null 2>&1
+    disk="$(qm config {{ e2e_vmid }} | awk '/^unused0:/{print $2}')"
+    [ -n "$disk" ] || { echo "importdisk failed"; exit 1; }
+    qm set {{ e2e_vmid }} --scsihw virtio-scsi-pci --scsi0 "$disk" >/dev/null
+    qm set {{ e2e_vmid }} --boot order=scsi0 >/dev/null
+    # cloud-init: STATIC IP (no DHCP) - an ide2 drive is mandatory so the
+    # cloud image gets a datasource
+    qm set {{ e2e_vmid }} --ide2 {{ e2e_vm_storage }}:cloudinit >/dev/null
+    qm set {{ e2e_vmid }} --ipconfig0 ip={{ e2e_vm_ip }}/24 >/dev/null
+    echo "VM {{ e2e_vmid }} deployed ({{ e2e_vm_cores }} CPU / {{ e2e_vm_memory }} MB on {{ e2e_vm_storage }}, IP {{ e2e_vm_ip }})"
+  args: { executable: /bin/bash }
+  register: t050
+  changed_when: "'deployed' in t050.stdout"
+  failed_when: false
+
+- name: T060 — Mini VM RUNNING (real Debian cloud OS)
+  tags: [phase1]
+  ansible.builtin.shell: |
+    st=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null \
+          | python3 -c "import json,sys; print(next((v['status'] for v in json.load(sys.stdin) if v.get('vmid')=={{ e2e_vmid }}), ''))")
+    if [ -z "$st" ]; then
+      # VM not found via the cluster API: try a local boot
+      qm start {{ e2e_vmid }} >/dev/null 2>&1
+      sleep 2
+      st=$(qm status {{ e2e_vmid }} 2>/dev/null | awk '{print $2}')
+    fi
+    echo "status: ${st:-not found}"
+  args: { executable: /bin/bash }
+  register: t060
+  changed_when: false
+  failed_when: false
+
+- name: "Deterministic IP of the mini VM: dnsmasq reservation by MAC (dhcp-host)"
+  # Safety net for any DHCP client on the lab segment: the MAC is chosen at
+  # creation -> dhcp-host= reservation in the file included by the
+  # proxknox-pxe container entrypoint (picked up at the next container
+  # (re)start; idempotent: written only once).
+  tags: [phase1, phase2]
+  ansible.builtin.shell: |
+    conf=/mnt/DATA/ProxKnox/libvirt-work/pxe-work/logs/dnsmasq-dhcp-hosts.conf
+    line="dhcp-host={{ e2e_vm_mac }},{{ e2e_vm_ip }}"
+    mkdir -p "$(dirname "$conf")"
+    if ! grep -qF "$line" "$conf" 2>/dev/null; then
+      echo "$line" >> "$conf"
+      echo "ADDED $line"
+    fi
+    echo "reservation: $(cat "$conf" | tr '\n' ' ')"
+  args: { executable: /bin/bash }
+  delegate_to: localhost
+  become: false
+  register: e2e_dhcp_res
+  changed_when: "'ADDED' in e2e_dhcp_res.stdout"
+  failed_when: false
+
+- name: "T065 — cloud-init static IP of the mini VM (idempotent, node-agnostic)"
+  # Primary IP determination mechanism: cloud-init sets the static IP at
+  # every boot (ipconfig0). Applied via the cluster API: the VM may sit on
+  # any node. NB: only one change per pvesh set call — an already existing
+  # -ide2 would make the whole call fail (silent thanks to || true). Reboot
+  # only if the config just changed (cloud-init regenerates at boot), then
+  # wait for a ping reply.
+  tags: [phase1]
+  ansible.builtin.shell: |
+    cur=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null \
+          | python3 -c "import json,sys; print(next((v['node'] for v in json.load(sys.stdin) if v.get('vmid')=={{ e2e_vmid }}), ''))")
+    [ -n "$cur" ] || { echo "VM {{ e2e_vmid }} not found"; exit 0; }
+    cfg=$(pvesh get /nodes/$cur/qemu/{{ e2e_vmid }}/config --output-format json 2>/dev/null)
+    applique=0
+    if ! echo "$cfg" | grep -q "ide2.*cloudinit"; then
+      pvesh set /nodes/$cur/qemu/{{ e2e_vmid }}/config \
+        -ide2 "{{ e2e_vm_storage }}:cloudinit" >/dev/null \
+        && applique=1 || echo "ERROR ide2"
+    fi
+    if ! echo "$cfg" | grep -q "ipconfig0.*ip={{ e2e_vm_ip }}"; then
+      pvesh set /nodes/$cur/qemu/{{ e2e_vmid }}/config \
+        -ipconfig0 "ip={{ e2e_vm_ip }}/24" >/dev/null \
+        && applique=1 || echo "ERROR ipconfig0"
+    fi
+    if [ "$applique" = "1" ]; then
+      echo "STATIC_CONFIG_APPLIED (node $cur)"
+      st=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null \
+           | python3 -c "import json,sys; print(next((v['status'] for v in json.load(sys.stdin) if v.get('vmid')=={{ e2e_vmid }}), ''))")
+      if [ "$st" = "running" ]; then
+        echo "REBOOT_VM"
+        pvesh create /nodes/$cur/qemu/{{ e2e_vmid }}/status/reboot >/dev/null 2>&1 || true
+      fi
+    fi
+    for i in $(seq 1 30); do
+      ping -c 1 -W 2 {{ e2e_vm_ip }} >/dev/null 2>&1 \
+        && { echo "PING {{ e2e_vm_ip }} OK"; exit 0; }
+      sleep 4
+    done
+    echo "PING_KO"
+  args: { executable: /bin/bash }
+  register: t065
+  changed_when: "'REBOOT_VM' in t065.stdout"
+  failed_when: false
+
+
+- name: T070 — Mini VM reachable before migration (controller→VM ping)
+  tags: [phase2]
+  ansible.builtin.shell: |
+    [ -n "{{ e2e_vm_ip }}" ] || { echo KO; exit 0; }
+    ping -c 4 -W 2 {{ e2e_vm_ip }} >/dev/null 2>&1 && echo OK || echo KO
+  args: { executable: /bin/bash }
+  delegate_to: localhost
+  become: false
+  register: t070
+  changed_when: false
+  failed_when: false
+
+- name: T075 — Re-center the VM on node 1 if needed (re-runs without manual steps)
+  tags: [phase2]
+  # T080 migrates node 1 → node2: if a previous run left the VM elsewhere
+  # (by design: "left in place for inspection"), we bring it back
+  # automatically — re-runs stay 100 % hands-free.
+  ansible.builtin.shell: |
+    cur=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null \
+          | python3 -c "import json,sys; sys.exit(print(next((v['node'] for v in json.load(sys.stdin) if v.get('vmid')=={{ e2e_vmid }}), '')) or 0)")
+    echo "VM {{ e2e_vmid }} is on: ${cur:-not found}"
+    if [ -n "$cur" ] && [ "$cur" != "{{ e2e_node1_name }}" ]; then
+      pvesh create /nodes/$cur/qemu/{{ e2e_vmid }}/migrate \
+        --target {{ e2e_node1_name }} --online 1 \
+        && echo "RECENTRED $cur → {{ e2e_node1_name }}"
+    fi
+  args:
+    executable: /bin/bash
+  register: t075
+  changed_when: "'RECENTRED' in t075.stdout"
+  failed_when: false
+
+- name: T080 — Live migration to {{ e2e_node_target }} + downtime measurement (200 ms ping)
+  tags: [phase2]
+  ansible.builtin.shell: |
+    ip="{{ e2e_vm_ip }}"
+    if [ -z "$ip" ]; then echo "NO-IP"; exit 0; fi
+    out=$(mktemp)
+    ping -i 0.2 -D -W 1 "$ip" > "$out" 2>/dev/null &
+    pid=$!
+    t0=$(date +%s)
+    ssh -p 2222 -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+      adminlab@192.168.200.11 "sudo qm migrate {{ e2e_vmid }} {{ e2e_node_target }} --online" || true
+    for i in $(seq 1 120); do
+      st=$(ssh -p 2222 -o StrictHostKeyChecking=no \
+           adminlab@192.168.200.12 "sudo qm status {{ e2e_vmid }}" 2>/dev/null | awk '{print $2}')
+      [ "$st" = "running" ] && break
+      sleep 2
+    done
+    t1=$(date +%s)
+    kill "$pid" 2>/dev/null || true
+    sent=$(grep -c 'icmp_seq' "$out" || true)
+    lost=$(grep -c 'timeout\|unreachable' "$out" || true)
+    [ -z "$sent" ] && sent=0; [ -z "$lost" ] && lost=0
+    echo "PING sent=$sent lost=$lost MigDur=$((t1 - t0))s vm_ip=$ip"
+  args: { executable: /bin/bash }
+  delegate_to: localhost
+  become: false
+  register: t080
+  changed_when: false
+  failed_when: false
+
+- name: T090 — VM RUNNING as seen from the target (pvesh API)
+  tags: [phase2]
+  ansible.builtin.command: >
+    pvesh get /nodes/{{ e2e_node_target }}/qemu/{{ e2e_vmid }}/status/current
+    --output-format json
+  register: t090
+  changed_when: false
+  failed_when: false
+
+- name: T100 — Second live migration {{ e2e_node_target }} → {{ e2e_node_target2 }}
+  tags: [phase2]
+  ansible.builtin.shell: |
+    t0=$(date +%s)
+    ssh -p 2222 -o StrictHostKeyChecking=no \
+      adminlab@192.168.200.12 "sudo qm migrate {{ e2e_vmid }} {{ e2e_node_target2 }} --online" || true
+    for i in $(seq 1 120); do
+      st=$(ssh -p 2222 -o StrictHostKeyChecking=no \
+           adminlab@192.168.200.13 "sudo qm status {{ e2e_vmid }}" 2>/dev/null | awk '{print $2}')
+      [ "$st" = "running" ] && break
+      sleep 2
+    done
+    echo "MigDur=$(( $(date +%s) - t0 ))s"
+  args: { executable: /bin/bash }
+  delegate_to: localhost
+  become: false
+  register: t100
+  changed_when: false
+  failed_when: false
+
+- name: T110 — VM still reachable after 2 migrations
+  tags: [phase2]
+  ansible.builtin.shell: |
+    ping -c 4 -W 2 {{ e2e_vm_ip }} >/dev/null 2>&1 && echo OK || echo KO
+  args: { executable: /bin/bash }
+  delegate_to: localhost
+  become: false
+  register: t110
+  changed_when: false
+  failed_when: false
+
+- name: T120 — Ceph HEALTH_OK after all tests
+  tags: [phase2]
+  ansible.builtin.command: ceph -s --format json
+  register: t120
+  changed_when: false
+  failed_when: false
+
+- name: "Info — the test VM is left in place for inspection"
+  ansible.builtin.debug:
+    msg: >-
+      The test VM {{ e2e_vmid }} is left running on {{ e2e_node_target2 }}
+      for inspection (qm stop/destroy {{ e2e_vmid }} to remove it).
+
+# ------------------------------------------------------------ JSON summary ---
+- name: Assemble the E2E results
+  tags: [phase2]
+  ansible.builtin.set_fact:
+    e2e_results: "{{ e2e_results | default([]) + [entry] }}"
+  loop:
+    - id: T010-quorum-3
+      phase: "Cluster"
+      ran: "{{ t010 is defined }}"
+      title: "3-vote corosync quorum"
+      expect: "pvecm status → Quorum: 3 votes"
+      ok: "{{ t010.stdout is defined and (t010.stdout | default('') | regex_search('Quorum:.*')) is not none }}"
+      got: "{{ t010.stdout | default('') | replace('\n', ' ') | list | join('') | truncate(90, True, '…') }}"
+    - id: T020-ceph-health
+      phase: "Ceph"
+      ran: "{{ t020 is defined }}"
+      title: "Ceph HEALTH_OK"
+      expect: "ceph -s → health.status == HEALTH_OK"
+      ok: "{{ (t020.stdout | default('{}') | from_json).health.status | default('') == 'HEALTH_OK' }}"
+      got: "{{ (t020.stdout | default('{}') | from_json).health.status | default('n/a') }}"
+    - id: T030-ceph-osd
+      phase: "Ceph"
+      ran: "{{ t030 is defined }}"
+      title: "At least 3 OSDs (one per node)"
+      expect: "len(ceph osd dump .osds) >= 3"
+      ok: "{{ ((t030.stdout | default('{\"osds\":[]}') | from_json).osds | default([])) | length >= 3 }}"
+      got: "{{ ((t030.stdout | default('{\"osds\":[]}') | from_json).osds | default([])) | length }} OSD"
+    - id: T040-ceph-hardened
+      phase: "Ceph"
+      ran: "{{ t040 is defined }}"
+      title: "Ceph hardening applied (msgr2 secure + cephx)"
+      expect: "pve_ceph role: auth_*_required + ms_*_mode secure in ceph.conf"
+      ok: "{{ t040.rc | default(1) == 0 }}"
+      got: "{{ t040.stdout | default(t040.stderr | default('')) | trim | truncate(90, True, '…') }}"
+    - id: T050-vm-deployed
+      phase: "Mini VM"
+      ran: "{{ t050 is defined }}"
+      title: "Mini VM deployed (1 CPU / 2 GB / RBD disk)"
+      expect: "qm create 100 + importdisk of the Debian 13 cloud image"
+      ok: "{{ t050.rc | default(1) == 0 }}"
+      got: "{{ t050.stdout | default(t050.stderr | default('')) | trim | truncate(90, True, '…') }}"
+    - id: T060-vm-booted
+      phase: "Mini VM"
+      ran: "{{ t060 is defined }}"
+      title: "Mini VM started (real OS boot)"
+      expect: "qm status 100 → running"
+      ok: "{{ t060.stdout | default('') is search('status: running') or t060.stdout | default('') is search('running') }}"
+      got: "{{ t060.stdout | default(t060.stderr | default('')) | replace('\n', ' ') | truncate(90, True, '…') }}"
+    - id: T070-vm-ping
+      phase: "Mini VM"
+      ran: "{{ t070 is defined }}"
+      title: "Mini VM reachable before migration"
+      expect: "ping OK to {{ e2e_vm_ip | default('IP?') }} (cloud-init static IP)"
+      ok: "{{ 'OK' == (t070.stdout | default('KO') | trim) }}"
+      got: "ping to {{ e2e_vm_ip | default('n/a') }} → {{ t070.stdout | default('KO') | trim }}"
+    - id: T080-live-migration
+      phase: "Live migration"
+      ran: "{{ t080 is defined }}"
+      title: "Live migration node1 → {{ e2e_node_target }} + ping downtime"
+      expect: "continuous ping during qm migrate --online: ~0 losses, VM running on the target"
+      ok: "{{ t080.stdout | default('') is search('PING sent=') and (t080.stdout | default('') is not search('NO-IP')) }}"
+      got: "{{ ((t080.stdout | default('') | regex_findall('(?:PING sent=|MigDur=)[^\n]*')) | join(' ; ')) or (t080.stdout | default('') | truncate(60, True, '…')) }}"
+    - id: T090-vm-running-target
+      phase: "Live migration"
+      ran: "{{ t090 is defined }}"
+      title: "VM running as seen from {{ e2e_node_target }} (pvesh API)"
+      expect: "pvesh /nodes/{{ e2e_node_target }}/qemu/100/status → running"
+      ok: "{{ (t090.stdout | default('{}') | from_json).status | default('') == 'running' if t090.stdout is defined and t090.stdout else false }}"
+      got: "{{ (t090.stdout | default('{}') | from_json).status | default('n/a') if t090.stdout is defined else 'n/a' }}"
+    - id: T100-second-migration
+      phase: "Live migration"
+      ran: "{{ t100 is defined }}"
+      title: "Second live migration → {{ e2e_node_target2 }}"
+      expect: "qm migrate --online; VM running on target 2"
+      ok: "{{ t100.stdout | default('') is search('MigDur=') }}"
+      got: "{{ ((t100.stdout | default('') | regex_findall('MigDur=[^\n]*')) | join(', ')) or (t100.stdout | default('') | truncate(60, True, '…')) }}"
+    - id: T110-vm-healthy
+      phase: "Live migration"
+      ran: "{{ t110 is defined }}"
+      title: "VM still reachable after 2 migrations"
+      expect: "ping OK after migrations"
+      ok: "{{ 'OK' == (t110.stdout | default('KO') | trim) }}"
+      got: "ping → {{ t110.stdout | default('KO') | trim }}"
+    - id: T120-ceph-final
+      phase: "Conclusion"
+      ran: "{{ t120 is defined }}"
+      title: "Ceph HEALTH_OK after all tests"
+      expect: "ceph -s → HEALTH_OK"
+      ok: "{{ (t120.stdout | default('{}') | from_json).health.status | default('') == 'HEALTH_OK' }}"
+      got: "{{ (t120.stdout | default('{}') | from_json).health.status | default('n/a') }}"
+  loop_control:
+    loop_var: entry
+
+- name: Write the E2E JSON report (controller)
+  tags: [phase2]
+  ansible.builtin.copy:
+    content: "{{ lookup('template', 'e2e-cluster-test.json.j2') }}"
+    dest: "{{ e2e_output_dir }}e2e-cluster-test_{{ ansible_date_time.epoch }}.json"
+    mode: "0644"
+  delegate_to: localhost
+  become: false

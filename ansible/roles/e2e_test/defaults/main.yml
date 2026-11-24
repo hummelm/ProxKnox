@@ -1,0 +1,32 @@
+---
+# e2e_test — End-to-end functional tests of the ProxKnox lab cluster
+# (3-node cluster + Ceph + mini VM + live migration) → JSON report
+# e2e-cluster-test_<epoch>.json (same spirit as the syver/pve_audit scans),
+# rendered by tools/e2e-report.py (single-page HTML, no dependencies).
+#
+# Prerequisites: the "net", "cluster" and "ceph" phases of e2e-cluster.yml
+# played, and the hardening from harden-pve.yml applied (with
+# pve_firewall_cluster_services=true).
+#
+# Each test yields a pass/fail status (changed_when/failed_when false — a
+# failure is information, not an error), a duration, and abbreviated output.
+
+# Identity of the mini test VM
+e2e_vmid: 100
+e2e_vmname: minitest
+e2e_vm_cores: 1
+e2e_vm_memory: 2048
+e2e_vm_mac: "52:54:00:be:ef:00"
+e2e_vm_storage: vmstorage
+# Deterministic IP of the mini VM: reserved by MAC in dnsmasq (dhcp-host,
+# phase1 task) AND set by cloud-init at creation (T050) -> no dnsmasq
+# lease lookup needed anymore.
+e2e_vm_ip: "192.168.200.192"
+# Debian 13 cloud image (direct boot, headless, DHCP on vmbr0)
+e2e_cloud_image_url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2"
+e2e_cloud_image: /mnt/DATA/ProxKnox/libvirt-work/pxe-work/iso/debian-13-generic-amd64.qcow2
+e2e_node1_name: proxknox-node1           # node where the tests re-center the VM (T075)
+e2e_node_target: proxknox-node2          # destination of the first live migration
+e2e_node_target2: proxknox-node3         # destination of the second one
+# Output
+e2e_output_dir: "{{ audit_output_destination | default(playbook_dir ~ '/audit-summaries/') }}"

@@ -1,0 +1,6 @@
+---
+# pve_cluster — HSE PVE9 Hardening Guide § 3.1, § 3.2
+# Only relevant for a CLUSTER: on a standalone node the role does nothing
+# (auto-detection). Corosync: dual ring (to be documented by the operator,
+# depends on the network topology) + secauth on.
+pve_cluster_corosync_conf: /etc/pve/corosync.conf

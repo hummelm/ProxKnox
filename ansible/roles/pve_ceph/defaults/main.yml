@@ -1,0 +1,32 @@
+---
+# pve_ceph — HSE PVE9 Hardening Guide § 3.3-3.5 (Ceph) + CIS-style "Level 2"
+# Ceph hardening (mandatory cephx authentication, msgr2 "secure mode"
+# encryption, keyring protection) complemented by:
+#   - E-NO "Ceph Security Hardening: Practical Implementation Guide"
+#     (auth_allow_insecure_global_id_reclaim, network exposure, keyrings)
+#   - Red Hat Ceph Storage 8 "Data Security and Hardening Guide"
+#     (vendor reference: cephx, key management, encrypted transport)
+#
+# The role is ENABLED via pve_hardening_ceph (ON by default) and
+# auto-noops if no Ceph is deployed on the node: in that case it merely
+# checks that no leftover Ceph daemon is running (reduced attack
+# surface) — the § 3.3/3.4 checks then have no object.
+
+# Config applied to [global] in /etc/ceph/ceph.conf (HSE § 3.5)
+pve_ceph_auth_required: cephx          # auth_{client,cluster,service}_required
+pve_ceph_ms_bind_msgr2: true           # messenger v2 (required for "secure")
+pve_ceph_ms_encrypt: true              # on-the-fly encryption
+pve_ceph_ms_cluster_mode: secure      # encrypted cluster network
+pve_ceph_ms_service_mode: secure       # encrypted daemon endpoints
+pve_ceph_ms_client_mode: secure        # encrypted client network
+pve_ceph_ms_mon_client_mode: secure    # client <-> MON connections
+pve_ceph_ms_mon_cluster_mode: secure   # internal MON traffic
+pve_ceph_ms_mon_service_mode: secure   # MON endpoints
+# E-NO/RH: forbid unauthenticated global ID reclaim
+# (post-CVE-2021-20288 hardening; Ceph default: false since Squid)
+pve_ceph_disable_insecure_global_id_reclaim: true
+
+# Default pool size (HSE § 3.3 — applied at pool creation; left
+# untouched here if pools already exist: design decision)
+pve_ceph_pool_size: 3
+pve_ceph_pool_min_size: 2

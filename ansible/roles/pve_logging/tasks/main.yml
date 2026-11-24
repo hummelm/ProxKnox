@@ -1,0 +1,44 @@
+---
+- name: Install auditd (if not already present via CIS Lockdown)
+  ansible.builtin.apt:
+    name: auditd
+    state: present
+
+- name: Persistent auditd rule for /etc/pve (§ 5.1.2)
+  ansible.builtin.copy:
+    dest: /etc/audit/rules.d/90-pve.rules
+    mode: "0640"
+    content: |
+      -w /etc/pve -p wa -k pve-config
+  register: _audit_pve_rules
+
+- name: Reload the audit rules (augenrules, § 5.1.2)
+  ansible.builtin.command: augenrules --load
+  when: _audit_pve_rules is changed
+  register: _augen
+  changed_when: "'No change' not in _augen.stdout"
+
+- name: Check that the /etc/pve watch is active
+  ansible.builtin.command: auditctl -l
+  register: _auditctl
+  changed_when: false
+  failed_when: _auditctl.rc != 0 or 'pve-config' not in _auditctl.stdout
+
+- name: Centralized forwarding of pve* logs (§ 5.1.1)
+  when: pve_logging_remote_host | default('', true) | length > 0
+  block:
+    - name: Install rsyslog
+      ansible.builtin.apt:
+        name: rsyslog
+        state: present
+    - name: Configure pve* log forwarding to {{ pve_logging_remote_host }}
+      ansible.builtin.template:
+        src: pve-forward.conf.j2
+        dest: /etc/rsyslog.d/30-pve-forward.conf
+        mode: "0644"
+      register: _rsyslog_fwd
+    - name: Restart rsyslog
+      ansible.builtin.systemd:
+        name: rsyslog
+        state: restarted
+      when: _rsyslog_fwd is changed

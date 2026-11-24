@@ -1,0 +1,12 @@
+// /etc/apt/apt.conf.d/50unattended-upgrades — ProxKnox (HSE PVE9 guide § 1.1.3)
+Unattended-Upgrade::Origins-Pattern {
+{% for origin in pve_autoupdate_origins %}
+        {{ origin }}
+{% endfor %}
+};
+
+Unattended-Upgrade::Remove-Unused-Dependencies "{{ 'true' if pve_autoupdate_remove_unused else 'false' }}";
+Unattended-Upgrade::Automatic-Reboot "{{ 'true' if pve_autoupdate_automatic_reboot else 'false' }}";
+{% if pve_autoupdate_mail | default('', true) | length > 0 %}
+Unattended-Upgrade::Mail "{{ pve_autoupdate_mail }}";
+{% endif %}

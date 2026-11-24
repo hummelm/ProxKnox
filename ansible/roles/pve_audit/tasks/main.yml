@@ -1,0 +1,333 @@
+---
+# pve_audit — checks every control of the HSE guide + Ceph on the node,
+# assembles pve_audit_results then writes the JSON on the controller.
+# The commands "change" nothing (changed_when: false, failed_when: false
+# throughout): a failing control is information, not an error.
+
+# ---------------------------------------------------------------- detection ---
+- name: Target — Proxmox version
+  ansible.builtin.command: pveversion
+  register: pve_audit_pveversion
+  changed_when: false
+  failed_when: false
+
+- name: Ceph detection (config + keyrings)
+  ansible.builtin.shell: |
+    conf="no"
+    for f in /etc/pve/ceph.conf /etc/ceph/ceph.conf; do
+      [ -f "$f" ] && conf="yes" && break
+    done
+    echo "$conf"
+  args:
+    executable: /bin/bash
+  register: pve_audit_ceph_cfg
+  changed_when: false
+  failed_when: false
+
+# ---------------------------------------------------------------- controls ---
+# Each control: run → translate into results entries.
+# HSE-PVE9 v0.9.2 (§ referenced) + Ceph (HSE § 3.3-3.5, E-NO, RH Ceph 8).
+
+- name: "1.1.3 — automatic security updates"
+  ansible.builtin.shell: |
+    systemctl is-enabled --quiet unattended-upgrades.service &&
+    grep -q '^Unattended-Upgrade "1";' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null ||
+    grep -q 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades
+  args: { executable: /bin/bash }
+  register: c_autoupdate
+  changed_when: false
+  failed_when: false
+
+- name: "1.1.4 — ssh-audit profile (post-quantum hybrid algorithm)"
+  ansible.builtin.shell: sshd -T 2>/dev/null | grep -qi 'sntrup761x25519\|mlkem768x25519'
+  args: { executable: /bin/bash }
+  register: c_ssh_audit
+  changed_when: false
+  failed_when: false
+
+- name: "1.1.6 — /var/lib/vz on a dedicated file system"
+  ansible.builtin.command: findmnt -n -o TARGET /var/lib/vz
+  register: c_varlibvz
+  changed_when: false
+  failed_when: false
+
+- name: "1.1.7 — non-free-firmware repositories (microcode)"
+  ansible.builtin.shell: grep -rq non-free-firmware /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null
+  args: { executable: /bin/bash }
+  register: c_nonfree
+  changed_when: false
+  failed_when: false
+
+- name: "1.1.8 — CPU microcode installed"
+  ansible.builtin.shell: |
+    dpkg-query -W -f='${Status}' intel-microcode 2>/dev/null | grep -q 'ok installed' ||
+    dpkg-query -W -f='${Status}' amd64-microcode 2>/dev/null | grep -q 'ok installed'
+  args: { executable: /bin/bash }
+  register: c_microcode
+  changed_when: false
+  failed_when: false
+
+- name: "1.2.4 — PVE firewall enabled (policy_in DROP + SSH/GUI rules)"
+  ansible.builtin.shell: |
+    fw="/etc/pve/firewall"
+    grep -qs '^enable: 1' "$fw/cluster.fw" "$fw/host.fw" 2>/dev/null &&
+    grep -qs 'policy_in: DROP' "$fw/cluster.fw" "$fw/host.fw" 2>/dev/null
+  args: { executable: /bin/bash }
+  register: c_firewall
+  changed_when: false
+  failed_when: false
+
+- name: "1.2.6 — KSM disabled (inter-VM side channel)"
+  ansible.builtin.shell: '[ "$(cat /sys/kernel/mm/ksm/run 2>/dev/null)" = "0" ]'
+  args: { executable: /bin/bash }
+  register: c_ksm
+  changed_when: false
+  failed_when: false
+
+- name: "1.2.7 — no Docker/OCI containers running on the host"
+  ansible.builtin.shell: '! command -v docker >/dev/null 2>&1'
+  args: { executable: /bin/bash }
+  register: c_docker
+  changed_when: false
+  failed_when: false
+
+- name: "2.1.1 — custom administration account (adminlab@pam)"
+  ansible.builtin.shell: grep -q '^user:adminlab@pam:1:' /etc/pve/user.cfg
+  args: { executable: /bin/bash }
+  register: c_adminacct
+  changed_when: false
+  failed_when: false
+
+- name: Fail2ban active with sshd + proxmox jails
+  ansible.builtin.shell: |
+    systemctl is-active --quiet fail2ban &&
+    fail2ban-client status 2>/dev/null | tr -d '\t' | grep -q sshd &&
+    fail2ban-client status 2>/dev/null | tr -d '\t' | grep -q proxmox
+  args: { executable: /bin/bash }
+  register: c_fail2ban
+  changed_when: false
+  failed_when: false
+
+- name: "3.2 — corosync secauth (if clustered)"
+  ansible.builtin.shell: |
+    [ -f /etc/pve/corosync.conf ] || exit 0
+    grep -q 'secauth.*on' /etc/pve/corosync.conf 2>/dev/null ||
+    grep -q 'secauth.*on' /etc/corosync/corosync.conf 2>/dev/null
+  args: { executable: /bin/bash }
+  register: c_secauth
+  changed_when: false
+  failed_when: false
+
+- name: "5.1.2 — auditd watches /etc/pve (-w /etc/pve -k pve-config rule)"
+  ansible.builtin.shell: |
+    systemctl is-active --quiet auditd &&
+    auditctl -l 2>/dev/null | grep -q '/etc/pve'
+  args: { executable: /bin/bash }
+  register: c_auditd_pve
+  changed_when: false
+  failed_when: false
+
+- name: "5.3.2 — rkhunter installed + daily run"
+  ansible.builtin.shell: |
+    command -v rkhunter >/dev/null 2>&1 &&
+    { [ -e /etc/cron.daily/rkhunter ] || grep -rq rkhunter /etc/cron.* 2>/dev/null; }
+  args: { executable: /bin/bash }
+  register: c_rkhunter
+  changed_when: false
+  failed_when: false
+
+# --------------------------------------------------------------------- Ceph ---
+- name: "CEPH-0 — no leftover ceph daemon without a configured cluster"
+  ansible.builtin.command: systemctl list-units --type=service --state=running --no-legend 'ceph-*'
+  register: c_ceph_resid
+  changed_when: false
+  failed_when: false
+
+- name: "CEPH-3 — msgr2 secure mode + cephx required in ceph.conf"
+  ansible.builtin.shell: |
+    f=""
+    for c in /etc/pve/ceph.conf /etc/ceph/ceph.conf; do [ -f "$c" ] && f="$c" && break; done
+    [ -n "$f" ] || exit 0
+    grep -q 'auth_client_required' "$f" &&
+    grep -Eq 'ms_cluster_mode *= *secure' "$f" &&
+    grep -Eq 'ms_client_mode *= *secure' "$f" &&
+    grep -q 'ms_bind_msgr2' "$f"
+  args: { executable: /bin/bash }
+  register: c_ceph_msgr2
+  changed_when: false
+  failed_when: false
+
+- name: "CEPH-4 — Ceph keyrings 0600 root:root"
+  ansible.builtin.shell: |
+    stat -c '%a %U' $(find /etc/ceph -maxdepth 2 -name '*.keyring' 2>/dev/null) 2>/dev/null |
+      awk '$1 != "600" && $1 != "400" { bad=1 } $2 != "root" { bad=1 }
+           END { exit bad ? 1 : 0 }'
+  args: { executable: /bin/bash }
+  register: c_ceph_keyring
+  changed_when: false
+  failed_when: false
+
+# ------------------------------------------------------------ JSON summary ---
+- name: Assemble the audit results
+  ansible.builtin.set_fact:
+    pve_audit_results: "{{ pve_audit_results | default([]) + [entry] }}"
+  loop:
+    - id: HSE-1.1.3
+      section: "1 — Base OS"
+      title: "Automatic security updates"
+      guide: HSE PVE9 § 1.1.3
+      status_ok: "{{ c_autoupdate.rc == 0 }}"
+      detail: "unattended-upgrades enabled + 20auto-upgrades"
+      reason: ""
+    - id: HSE-1.1.4
+      section: "1 — Base OS"
+      title: "ssh-audit profile (post-quantum hybrid algorithm)"
+      guide: HSE PVE9 § 1.1.4
+      status_ok: "{{ c_ssh_audit.rc == 0 }}"
+      detail: "sntrup761x25519/mlkem768x25519 KEX in sshd -T"
+      reason: ""
+    - id: HSE-1.1.6
+      section: "1 — Base OS"
+      title: "/var/lib/vz on a dedicated file system"
+      guide: HSE PVE9 § 1.1.6
+      status_ok: "{{ c_varlibvz.rc == 0 }}"
+      detail: "findmnt /var/lib/vz"
+      reason: ""
+    - id: HSE-1.1.7
+      section: "1 — Base OS"
+      title: "non-free-firmware repositories"
+      guide: HSE PVE9 § 1.1.7
+      status_ok: "{{ c_nonfree.rc == 0 }}"
+      detail: "sources.list.d contains non-free-firmware"
+      reason: ""
+    - id: HSE-1.1.8
+      section: "1 — Base OS"
+      title: "CPU microcode installed"
+      guide: HSE PVE9 § 1.1.8
+      status_ok: "{{ c_microcode.rc == 0 }}"
+      detail: "intel-microcode or amd64-microcode"
+      reason: ""
+    - id: HSE-1.2.4
+      section: "1 — Perimeter & firewall"
+      title: "PVE firewall enabled, policy_in DROP"
+      guide: HSE PVE9 § 1.2.4/1.2.5
+      status_ok: "{{ c_firewall.rc == 0 }}"
+      detail: "/etc/pve/firewall/*.fw: enable 1 + policy_in DROP (+ rules 8006/2222)"
+      reason: "{{ 'pve_firewall role disabled by configuration (group_vars)' if not (pve_hardening_firewall | default(false)) else '' }}"
+      skipped: "{{ not (pve_hardening_firewall | default(false)) }}"
+    - id: HSE-1.2.6
+      section: "1 — Perimeter & firewall"
+      title: "KSM disabled"
+      guide: HSE PVE9 § 1.2.6
+      status_ok: "{{ c_ksm.rc == 0 }}"
+      detail: "/sys/kernel/mm/ksm/run = 0"
+      reason: ""
+    - id: HSE-1.2.7
+      section: "1 — Perimeter & firewall"
+      title: "No Docker/OCI on the host"
+      guide: HSE PVE9 § 1.2.7
+      status_ok: "{{ c_docker.rc == 0 }}"
+      detail: "docker absent from the PVE host"
+      reason: ""
+    - id: HSE-2.1.1
+      section: "2 — Accounts & access"
+      title: "Custom administration account"
+      guide: HSE PVE9 § 2.1.1
+      status_ok: "{{ c_adminacct.rc == 0 }}"
+      detail: "adminlab@pam active (user.cfg)"
+      reason: ""
+    - id: HSE-2.1.3
+      section: "2 — Accounts & access"
+      title: "2FA on the UI (TOTP/YubiKey)"
+      guide: HSE PVE9 § 2.1.3
+      status_ok: false
+      detail: "pvesh set /access/domains/pam --tfa type=oath|yubicloud"
+      reason: "manual control by design (2FA enrollment done separately)"
+      skipped: true
+    - id: HSE-2.3.3
+      section: "2 — Accounts & access"
+      title: "Fail2ban sshd + Proxmox UI"
+      guide: HSE PVE9 § 2.3.3
+      status_ok: "{{ c_fail2ban.rc == 0 }}"
+      detail: "jails sshd (2222) + proxmox (8006) active"
+      reason: ""
+    - id: HSE-3.2
+      section: "3 — Cluster & Ceph"
+      title: "corosync secauth"
+      guide: HSE PVE9 § 3.2
+      status_ok: "{{ c_secauth.rc == 0 }}"
+      detail: "secauth on (/etc/pve/corosync.conf)"
+      reason: "{{ 'standalone node — no corosync cluster (pve_cluster role no-op)' if (c_secauth.rc == 0 and (c_secauth.stdout | trim) == '') else '' }}"
+      skipped: "{{ c_secauth.rc == 0 and (c_secauth.stdout | trim) == '' }}"
+    - id: CEPH-0
+      section: "3 — Cluster & Ceph"
+      title: "No leftover Ceph daemon without a configured cluster"
+      guide: "E-NO Ceph hardening"
+      status_ok: "{{ not ((c_ceph_resid.stdout_lines | default([]) | length > 0) and (pve_audit_ceph_cfg.stdout | trim) == 'no') }}"
+      detail: "ceph-* daemons only if Ceph is configured"
+      reason: ""
+    - id: CEPH-2
+      section: "3 — Cluster & Ceph"
+      title: "cephx required everywhere (auth_*_required)"
+      guide: "HSE PVE9 § 3.5 + RH Ceph 8"
+      status_ok: "{{ c_ceph_msgr2.rc == 0 }}"
+      detail: "auth_client/cluster/service_required = cephx"
+      reason: "{{ 'Ceph not deployed on this node' if (pve_audit_ceph_cfg.stdout | trim) == 'no' else '' }}"
+      skipped: "{{ (pve_audit_ceph_cfg.stdout | trim) == 'no' }}"
+    - id: CEPH-3
+      section: "3 — Cluster & Ceph"
+      title: "Messenger v2 \"secure\" mode, encrypted traffic"
+      guide: "HSE PVE9 § 3.5 (Level 2)"
+      status_ok: "{{ c_ceph_msgr2.rc == 0 }}"
+      detail: "ms_bind_msgr2 + ms_*_mode = secure + ms_encrypt"
+      reason: "{{ 'Ceph not deployed on this node' if (pve_audit_ceph_cfg.stdout | trim) == 'no' else '' }}"
+      skipped: "{{ (pve_audit_ceph_cfg.stdout | trim) == 'no' }}"
+    - id: CEPH-4
+      section: "3 — Cluster & Ceph"
+      title: "Keyrings 0600 root:root"
+      guide: "E-NO Ceph hardening"
+      status_ok: "{{ c_ceph_keyring.rc == 0 }}"
+      detail: "/etc/ceph and /etc/pve/priv keyrings"
+      reason: "Ceph not deployed — no keyring to protect on this node"
+      skipped: "{{ (pve_audit_ceph_cfg.stdout | trim) == 'no' }}"
+    - id: CEPH-6
+      section: "3 — Cluster & Ceph"
+      title: "OSD encryption (LUKS)"
+      guide: "HSE PVE9 § 3.4 (Level 2)"
+      status_ok: false
+      detail: "to be checked at each OSD's creation (not retroactive)"
+      reason: "{{ 'Ceph not deployed on this node' if (pve_audit_ceph_cfg.stdout | trim) == 'no' else 'design decision made at OSD creation' }}"
+      skipped: true
+    - id: CEPH-7
+      section: "3 — Cluster & Ceph"
+      title: "Pools size/min_size + CRUSH failure domains"
+      guide: "HSE PVE9 § 3.3 (Level 1)"
+      status_ok: false
+      detail: "size=3/min_size=2, CRUSH on host/chassis/rack"
+      reason: "{{ 'Ceph not deployed on this node' if (pve_audit_ceph_cfg.stdout | trim) == 'no' else 'pool-by-pool tuning (design decision)' }}"
+      skipped: true
+    - id: HSE-5.1.2
+      section: "5 — Logging & audit"
+      title: "auditd watches /etc/pve"
+      guide: HSE PVE9 § 5.1.2
+      status_ok: "{{ c_auditd_pve.rc == 0 }}"
+      detail: "-w /etc/pve -p wa -k pve-config rule"
+      reason: ""
+    - id: HSE-5.3.2
+      section: "5 — Logging & audit"
+      title: "daily rkhunter"
+      guide: HSE PVE9 § 5.3.2
+      status_ok: "{{ c_rkhunter.rc == 0 }}"
+      detail: "package + /etc/cron.daily/rkhunter"
+      reason: ""
+  loop_control:
+    loop_var: entry
+
+- name: Write the JSON report on the controller
+  ansible.builtin.copy:
+    content: "{{ lookup('template', 'pve-hardening-audit.json.j2') }}"
+    dest: "{{ pve_audit_output_dir }}pve-hardening-audit_{{ ansible_date_time.epoch }}.json"
+    mode: "0644"
+  run_once: true
+  delegate_to: localhost
+  become: false

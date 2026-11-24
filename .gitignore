@@ -1,0 +1,4 @@
+ansible/roles/ansible-lockdown*
+ansible/inventory/hosts.yml
+**/audit-summaries/
+__pycache__/

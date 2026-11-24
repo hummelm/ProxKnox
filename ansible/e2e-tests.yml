@@ -1,0 +1,11 @@
+---
+# e2e-tests.yml — runs the e2e_test role on proxknox-node1 and writes the
+# JSON report. Prerequisites: e2e-cluster.yml (net/cluster/ceph phases)
+# + harden-pve.yml already played. Driven by tools/e2e-cluster-test.sh.
+- name: "E2E tests — cluster + Ceph + tiny VM + live migration"
+  hosts: pxe-client
+  become: true
+  gather_facts: true
+  roles:
+    - role: e2e_test
+      tags: [e2e]

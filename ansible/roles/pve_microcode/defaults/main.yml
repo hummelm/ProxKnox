@@ -1,0 +1,9 @@
+---
+# pve_microcode — HSE PVE9 Hardening Guide § 1.1.7 + § 1.1.8
+# Enables the non-free-firmware component if needed, then installs the CPU
+# microcode (Intel or AMD, auto-detected). The microcode is loaded at boot:
+# a reboot is recommended afterwards (not enforced).
+
+# Add the non-free-firmware component if the microcode is unavailable
+pve_microcode_add_nonfree_firmware: true
+pve_microcode_debian_mirror: http://deb.debian.org/debian

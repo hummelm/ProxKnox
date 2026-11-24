@@ -1,0 +1,33 @@
+---
+- name: Install rkhunter
+  ansible.builtin.apt:
+    name: rkhunter
+    state: present
+
+- name: Check whether a package-provided daily cron already exists
+  ansible.builtin.stat:
+    path: /etc/cron.daily/rkhunter
+  register: _rkh_packaged_cron
+
+- name: Install the daily check (if not shipped by the package, § 5.3.2)
+  ansible.builtin.copy:
+    dest: "{{ pve_rkhunter_cron_file }}"
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      # Daily rkhunter check — HSE PVE9 Hardening Guide § 5.3.2
+      /usr/bin/rkhunter --check --skip-keypress --quiet || true
+  when: not _rkh_packaged_cron.stat.exists
+
+- name: Update the rkhunter signature database (best effort, § 5.3.2)
+  ansible.builtin.command: rkhunter --update --sk
+  register: _rkh_update
+  failed_when: false
+
+- name: Warn if the rkhunter update failed (mirrors, network…)
+  ansible.builtin.debug:
+    msg: >
+      rkhunter --update returned {{ _rkh_update.rc }} (non-blocking —
+      the database will be updated by the package cron / apt, and the daily
+      check remains in place).
+  when: _rkh_update.rc != 0

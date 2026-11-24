@@ -1,0 +1,42 @@
+---
+- name: Install fail2ban
+  ansible.builtin.apt:
+    name: fail2ban
+    state: present
+
+- name: proxmox filter (pvedaemon, § 2.3.3)
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/filter.d/proxmox.conf
+    mode: "0644"
+    content: |
+      [Definition]
+      failregex = pvedaemon\[.*authentication failure; rhost=<HOST> user=.* msg=.*
+      ignoreregex =
+  register: _f2b_filter
+
+- name: sshd + proxmox jails (§ 2.3.3 — jail.d drop-in, does not touch jail.local)
+  ansible.builtin.template:
+    src: proxknox-fail2ban.j2
+    dest: /etc/fail2ban/jail.d/proxknox.local
+    mode: "0644"
+  register: _f2b_jail
+
+- name: Restart fail2ban if needed
+  ansible.builtin.systemd:
+    name: fail2ban
+    state: restarted
+  when: _f2b_filter is changed or _f2b_jail is changed
+
+- name: Check that the jails are active
+  ansible.builtin.command: fail2ban-client status
+  register: _f2b_status
+  changed_when: false
+  failed_when: "'proxmox' not in _f2b_status.stdout or 'sshd' not in _f2b_status.stdout"
+
+- name: Check the proxmox jail
+  ansible.builtin.command: fail2ban-client status proxmox
+  register: _f2b_pve
+  changed_when: false
+  failed_when: "'Status for the jail: proxmox' not in _f2b_pve.stdout
+    or 'Currently banned' not in _f2b_pve.stdout
+    or 'Banned IP list' not in _f2b_pve.stdout"

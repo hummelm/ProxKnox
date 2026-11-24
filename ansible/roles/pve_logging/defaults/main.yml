@@ -1,0 +1,9 @@
+---
+# pve_logging — HSE PVE9 Hardening Guide § 5.1.1, § 5.1.2
+# auditd: persistent rule monitoring the /etc/pve distributed filesystem.
+# rsyslog: forward pve* logs to a central collector.
+
+# Remote syslog collector (e.g. 192.168.122.1) — empty = no forwarding
+pve_logging_remote_host: ""
+pve_logging_remote_port: 514
+pve_logging_remote_protocol: tcp

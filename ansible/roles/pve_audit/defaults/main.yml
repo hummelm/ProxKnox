@@ -1,0 +1,19 @@
+---
+# pve_audit — Proxmox VE hardening audit (HomeSecExplorer guide v0.9.2
+#              + Ceph hardening HSE § 3.3-3.5 / E-NO / Red Hat Ceph 8).
+#
+# Produces a JSON report <audit_output_destination>/pve-hardening-audit_<epoch>.json
+# in the same spirit as the ansible-lockdown role's syver scans (results/summary),
+# later consolidated by tools/audit-report.py together with the pre/post CIS scans.
+#
+# Control status:
+#   successful=true + skipped=false → compliant
+#   successful=false + skipped=false → deviation found
+#   skipped=true                        → not applicable (reason in "reason"):
+#                                         role intentionally disabled, control
+#                                         manual by design, Ceph not deployed
+#
+# Always ON by default (pve_hardening_audit): this is evidence, not an action.
+
+# Output directory (same as the Lockdown audit: ansible/audit-summaries/)
+pve_audit_output_dir: "{{ audit_output_destination | default(playbook_dir ~ '/audit-summaries/') }}"
