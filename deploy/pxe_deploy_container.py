@@ -23,9 +23,13 @@
 # during the Proxmox conversion). The client kernel/initrd are then
 # extracted from the ISO (install.amd/) instead of the netboot tree.
 #
-# Usage: python3 deploy/pxe_deploy_container.py [--iso [PATH|URL]]
+# Usage: python3 deploy/pxe_deploy_container.py [--iso [PATH|URL]] [--encrypt]
 # Env  : ROOT_PW, ADMIN_PW, SSH_PUBKEY_FILE, DISK_POOL, ISO_PATH (path or
 #        URL), ISO_URL (default URL), DEB_VERSION, all overridable.
+#        --encrypt / ENCRYPT_DISK=1: LUKS2 disk encryption with automatic
+#        unlock by the VM's vTPM (clevis tpm2 pin, see LUKS_TPM_ENROLL);
+#        passphrase LUKS_PW (kept as the manual fallback keyslot); swtpm
+#        required on the host for the vTPM device.
 
 import argparse
 import hashlib
@@ -95,6 +99,157 @@ LEASE_FILE = "/srv/logs/dnsmasq.leases"     # in the container (mounted volume)
 DI_SYSLOG = "logs/di-syslog.log"             # host side (workdir/logs/...)
 IPT_TAG = "proxknox-pxe"
 
+# vTPM device added to the client VM with --encrypt: emulator backend
+# (swtpm on the host), TPM 2.0, CRB interface. The state (per-VM,
+# /var/lib/libvirt/qemu/tpm/) holds the sealed key material; it is wiped
+# on `virsh undefine --nvram` (cleanup of every run) — keep the LUKS
+# passphrase fallback to decrypt a moved/recovered disk elsewhere.
+TPM_XML = "<tpm model='tpm-crb'><backend type='emulator' version='2.0'/></tpm>"
+
+# --encrypt: script run on the freshly installed node (over SSH, BEFORE the
+# PVE conversion) to enroll the LUKS2 container in the vTPM. clevis (NOT
+# systemd-cryptenroll) because Debian/Proxmox boot via initramfs-tools and
+# clevis ships the initramfs unlocker + crypttab integration for it.
+# Placeholders __LUKSPW__ / __PINCFG__ substituted by the orchestrator.
+# The pin config is "{}" (no PCR binding) by default: this lab boots via
+# SeaBIOS, whose firmware measures NOTHING into the PCRs — PCR binding
+# would add no protection here and only risk a locked disk. LUKS_TPM_PCRS
+# (e.g. "7" or "0,2,7") lets a UEFI/Secure Boot user bind anyway.
+LUKS_TPM_ENROLL = r"""#!/bin/bash
+# ProxKnox --encrypt: enroll the node's LUKS2 container in its vTPM
+# (clevis tpm2 pin) so the disk unlocks automatically at boot.
+# The passphrase keyslot 0 installed by d-i stays as the manual fallback.
+set -euo pipefail
+PASS="__LUKSPW__"
+CFG="__PINCFG__"
+
+DEV="$(lsblk -rnpo NAME,TYPE,FSTYPE | awk '$2=="part" && $3=="crypto_LUKS"{print $1; exit}')"
+[ -n "$DEV" ] || { echo "[luks-tpm] no crypto_LUKS partition found (was --encrypt passed to the deploy?)"; exit 1; }
+[ -e /dev/tpm0 ] || [ -e /dev/tpmrm0 ] || { echo "[luks-tpm] no TPM device visible (vTPM missing from the VM?)"; exit 1; }
+
+if cryptsetup luksDump "$DEV" | grep -qi clevis; then
+    echo "[luks-tpm] $DEV already enrolled in the TPM"
+    BIND_NEEDED=0
+else
+    BIND_NEEDED=1
+fi
+
+echo "[luks-tpm] LUKS container: $DEV"
+export DEBIAN_FRONTEND=noninteractive
+echo "[luks-tpm] installing clevis-luks clevis-tpm2 clevis-initramfs tpm2-tools"
+apt-get -y -qq install clevis-luks clevis-tpm2 clevis-initramfs tpm2-tools
+
+if [ "$BIND_NEEDED" = 1 ]; then
+    echo "[luks-tpm] binding the TPM2 pin (config: $CFG)"
+    printf '%s\n' "$PASS" | clevis luks bind -f -d "$DEV" tpm2 "$CFG"
+fi
+
+# The first-boot bootstrap key (passphrase file in the initramfs, cf.
+# ENCRYPT_LATE_CMD) is no longer needed: the vTPM does the unlocking now
+# and the LUKS passphrase remains as the console fallback. Revert the
+# crypttab entry and remove the key + hook BEFORE update-initramfs below
+# (single rebuild: clevis + TPM modules + bootstrap key removal).
+awk '$3=="/root/.luks-bootkey"{$3="none"; sub(/,keyscript=\/bin\/cat/,"",$4)} {print}' \
+    /etc/crypttab > /etc/crypttab.new && mv /etc/crypttab.new /etc/crypttab
+rm -f /root/.luks-bootkey /etc/initramfs-tools/hooks/proxknox-bootkey-hook \
+      /usr/local/sbin/proxknox-luks-bootstrap
+
+# TPM kernel modules in initramfs-tools (not pulled in automatically):
+# required to reach the vTPM from the initramfs at unlock time
+cat > /etc/initramfs-tools/hooks/proxknox-tpm <<'HOOK'
+#!/bin/sh
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+    prereqs) prereqs; exit 0;;
+esac
+. /usr/share/initramfs-tools/hook-functions
+copy_modules_dir kernel/drivers/char/tpm
+HOOK
+chmod 755 /etc/initramfs-tools/hooks/proxknox-tpm
+update-initramfs -u
+
+echo "[luks-tpm] keyslots:"
+cryptsetup luksDump "$DEV" | sed -n '/Key [Ss]lots/,$p' | grep -E '[Ss]lot|tlv|clevis' || true
+echo "[luks-tpm] vTPM enrollment done"
+"""
+
+# --encrypt, d-i stage: the FIRST reboot after the installation lands on
+# the cryptsetup passphrase prompt with nobody there — the very first
+# unlock has no TPM binding yet. Bootstrap: d-i's late_command fetches the
+# passphrase key + a bootstrap script over HTTP and runs the latter
+# INSIDE the target. The script (LUKS_BOOTSTRAP below) does not rely on
+# the state of /etc/crypttab at late_command time (d-i writes it at its
+# own finish-install timing — the naive awk rewrite of run 1 emptied it):
+# it finds the LUKS partition + UUID itself, rewrites or seeds the entry,
+# installs the initramfs hook that embeds the key, rebuilds the initramfs.
+# The enrollment script (LUKS_TPM_ENROLL) later reverts the crypttab entry
+# and deletes key + hook: the vTPM then unlocks at every boot and the
+# passphrase stays as the console fallback. __LURL__ = served-files URL.
+ENCRYPT_LATE_CMD = """ ; \\
+    in-target wget -q -O /root/.luks-bootkey __LURL__/proxknox-bootkey ; \\
+    in-target chmod 600 /root/.luks-bootkey ; \\
+    in-target wget -q -O /usr/local/sbin/proxknox-luks-bootstrap \\
+        __LURL__/proxknox-luks-bootstrap ; \\
+    in-target chmod 755 /usr/local/sbin/proxknox-luks-bootstrap ; \\
+    in-target /usr/local/sbin/proxknox-luks-bootstrap"""
+
+# Served over HTTP to the target during d-i (mknod-free, plain /bin/sh):
+# no operator input, no quoting layers.
+LUKS_BOOTSTRAP = """#!/bin/sh
+# ProxKnox --encrypt: first-boot bootstrap. Point /etc/crypttab at the
+# bootstrap key file (passphrase embedded in the initramfs via
+# keyscript=/bin/cat) so the first reboot unlocks unattended; the vTPM
+# enrollment later REMOVES all of this (keyslot passphrase remains).
+set -e
+KEY=/root/.luks-bootkey
+[ -s "$KEY" ] || { echo "[luks-bootstrap] missing $KEY (not served?)"; exit 1; }
+# cryptsetup reads the keyscript pipe RAW (--key-file=-): strip any
+# trailing newline or the key will not match the passphrase
+printf "%s" "$(cat "$KEY")" > "$KEY"
+CRYPT=$(lsblk -rnpo NAME,FSTYPE | awk '$2=="crypto_LUKS"{print $1; exit}')
+[ -n "$CRYPT" ] || { echo "[luks-bootstrap] no crypto_LUKS partition found"; exit 1; }
+UUID=$(blkid -s UUID -o value "$CRYPT")
+NAME=$(basename "$CRYPT")_crypt
+echo "[luks-bootstrap] LUKS: $CRYPT (UUID=$UUID) -> $NAME"
+
+# /etc/crypttab: d-i writes "<name> UUID=<uuid> none luks,discard,..." —
+# rewrite the matching UUID line; seed our own if the crypttab is absent,
+# empty or has no matching line (d-i timing).
+if [ -s /etc/crypttab ]; then
+    awk -v uuid="$UUID" -v key="$KEY" \\
+        '$2=="UUID="uuid{$3=key; $4=$4 ",keyscript=/bin/cat"} {print}' \\
+        /etc/crypttab > /etc/crypttab.proxknox
+else
+    : > /etc/crypttab.proxknox
+fi
+grep -q "UUID=$UUID" /etc/crypttab.proxknox ||
+    echo "$NAME UUID=$UUID $KEY luks,keyscript=/bin/cat" >> /etc/crypttab.proxknox
+mv /etc/crypttab.proxknox /etc/crypttab
+chmod 600 /etc/crypttab
+grep -q "UUID=$UUID .*keyscript" /etc/crypttab ||
+    { echo "[luks-bootstrap] crypttab rewrite failed"; exit 1; }
+echo "[luks-bootstrap] crypttab: $(grep "UUID=$UUID" /etc/crypttab)"
+
+# initramfs hook: embed the key file in the initramfs
+cat > /etc/initramfs-tools/hooks/proxknox-bootkey-hook <<'HOOK'
+#!/bin/sh
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+    prereqs) prereqs; exit 0;;
+esac
+. /usr/share/initramfs-tools/hook-functions
+mkdir -p "$DESTDIR/root"
+cp /root/.luks-bootkey "$DESTDIR/root/.luks-bootkey"
+chmod 600 "$DESTDIR/root/.luks-bootkey"
+HOOK
+chmod 755 /etc/initramfs-tools/hooks/proxknox-bootkey-hook
+
+update-initramfs -u
+echo "[luks-bootstrap] done: first-boot unlock ready"
+"""
+
 SSH_OPTS = ["-p", "2222", "-i", "/srv/keys/deploy_key",
             "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
             "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR"]
@@ -162,11 +317,26 @@ def force_boot_hd_then_network(xml):
     return xml
 
 
+def add_tpm_device(xml):
+    """--encrypt: adds the vTPM 2.0 (swtpm emulator, CRB) to the VM XML.
+    libvirt launches swtpm itself for an emulator backend; the host
+    packages are checked in step_prereqs."""
+    if "<tpm " in xml:
+        return xml
+    if "</devices>" not in xml:
+        die("XML: </devices> not found (cannot insert the vTPM).")
+    return xml.replace("  </devices>", f"    {TPM_XML}\n  </devices>", 1)
+
+
 # ------------------------------------------------------------------ steps ---
 def step_prereqs(cfg):
     log(f"Prerequisites: docker, libvirt, isolated network {PXE_NET} — OK")
-    for cmd in ("virsh", "virt-install", "docker", "wget") + (
-            ("xorriso",) if cfg.iso_mode else ()):
+    cmds = ["virsh", "virt-install", "docker", "wget"]
+    if cfg.iso_mode:
+        cmds.append("xorriso")
+    if cfg.encrypt:
+        cmds += ["swtpm", "swtpm_setup"]
+    for cmd in cmds:
         if not shutil.which(cmd):
             die(f"Missing command: {cmd}")
     if docker("info", timeout=10).returncode != 0:
@@ -246,9 +416,44 @@ def step_prepare_files(cfg):
                 encoding="utf-8").read()
     text = text.replace(f"http://{PXE_IP}/", f"http://{PXE_IP}:{HTTP_PORT}/")
     for k, v in {"__ROOTPW__": cfg.root_pw, "__ADMIN_PW__": cfg.admin_pw,
+                 "__LUKSPW__": cfg.luks_pw,
                  "__HOST_PUBKEY__": host_pubkey,
                  "__NODEHOSTNAME__": cfg.node_hostname}.items():
         text = text.replace(k, v)
+    if cfg.encrypt:
+        # partman switches from plain LVM to "crypto": LUKS2 container
+        # with the whole VG (and all $lvmok volumes) inside. The
+        # ##ENCRYPT## lines of client-preseed.cfg (crypto passphrase +
+        # confirmations) are activated.
+        text = text.replace("d-i partman-auto/method string lvm",
+                            "d-i partman-auto/method string crypto", 1)
+        text = "\n".join(
+            l[len("##ENCRYPT##"):] if l.startswith("##ENCRYPT##") else l
+            for l in text.splitlines()) + "\n"
+        # first-boot bootstrap (cf. ENCRYPT_LATE_CMD): the passphrase key
+        # + initramfs hook are served over HTTP with the other files
+        anc = "    in-target chmod 440 /etc/sudoers.d/90-admin-lab"
+        if anc not in text:
+            die("preseed: late_command anchor not found (bootstrap key).")
+        text = text.replace(anc, anc + ENCRYPT_LATE_CMD.replace(
+            "__LURL__", FILES_URL), 1)
+        key_path = os.path.join(cfg.workdir, "files", "proxknox-bootkey")
+        # exact passphrase bytes, NO trailing newline: the initramfs
+        # keyscript pipe feeds cryptsetup raw (--key-file=-), where a
+        # stray \n makes the key wrong (unlock failed: "No key available
+        # with this passphrase", observed on the run of 25/11/2026)
+        open(key_path, "w", encoding="utf-8").write(cfg.luks_pw)
+        os.chmod(key_path, 0o600)
+        open(os.path.join(cfg.workdir, "files", "proxknox-luks-bootstrap"),
+             "w", encoding="utf-8").write(LUKS_BOOTSTRAP)
+    else:
+        # strip the inactive crypto lines: d-i would choke on them
+        text = "\n".join(l for l in text.splitlines()
+                         if not l.startswith("##ENCRYPT##")) + "\n"
+        for leftover in ("proxknox-bootkey", "proxknox-luks-bootstrap"):
+            p = os.path.join(cfg.workdir, "files", leftover)
+            if os.path.exists(p):
+                os.remove(p)
     if cfg.iso_mode:
         # Install from the ISO: NO network mirror, NO upgrade (upgrades
         # will happen during the Proxmox VE conversion). Packages come
@@ -461,6 +666,10 @@ def step_create_client(cfg):
     virsh("destroy", cfg.node_name, check=False)
     xml_path = os.path.join(cfg.workdir, f"{cfg.node_name}.xml")
     xml = force_boot_hd_then_network(virsh("dumpxml", cfg.node_name).stdout)
+    if cfg.encrypt:
+        xml = add_tpm_device(xml)
+        if "<tpm " not in xml:
+            die("XML: vTPM device not found after edit.")
     open(xml_path, "w", encoding="utf-8").write(xml)
     virsh("define", xml_path)
     virsh("start", cfg.node_name)
@@ -584,6 +793,57 @@ def step_wait_installed_client(cfg):
         if r.returncode != 0:
             die("apt source switch (post-ISO) failed: "
                 f"{(r.stdout or r.stderr or '').strip()[:300]}")
+
+    # --encrypt: LUKS -> vTPM enrollment. Runs BEFORE the conversion: its
+    # 2 unattended reboots need the automatic unlock (and, in ISO mode,
+    # after the fixup above that restored the Debian mirrors, from which
+    # clevis is installed). clevis instead of systemd-cryptenroll because
+    # Debian/Proxmox unlock the root in an initramfs-tools environment.
+    if cfg.encrypt:
+        pcrs = cfg.luks_tpm_pcrs
+        pin_cfg = ('{"pcr_bank":"sha256","pcr_ids":"%s"}' % pcrs
+                   ) if pcrs else "{}"
+        log(f"Encrypt: enrolling the LUKS2 container of {client_ip} in "
+            f"the vTPM (clevis tpm2, "
+            f"{'PCR ' + pcrs if pcrs else 'no PCR binding'})")
+        r = ssh_in_container(client_ip,
+                             "cat > /root/luks-tpm-enroll.sh && "
+                             "chmod +x /root/luks-tpm-enroll.sh && "
+                             "bash /root/luks-tpm-enroll.sh",
+                             check=False, timeout=900,
+                             input=LUKS_TPM_ENROLL
+                                 .replace("__LUKSPW__", cfg.luks_pw)
+                                 .replace("__PINCFG__", pin_cfg))
+        if r.returncode != 0:
+            out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
+            out = out.strip() or "(no output)"
+            # keep the tail: enroll errors (dpkg/apt, clevis) surface at the
+            # END of the output, a head slice hid the real cause once.
+            die("LUKS->vTPM enrollment failed: " + out[-1500:])
+        # verification = this reboot: nobody is there to type the LUKS
+        # passphrase, so SSH coming back means the vTPM actually unlocked
+        log("Encrypt: rebooting the node — proves the vTPM auto-unlock")
+        ssh_in_container(client_ip, "systemctl reboot", check=False)
+        # first wait for SSH to go DOWN (it answers briefly during the
+        # shutdown), then for it to come back: nobody can type the
+        # passphrase, so SSH returning means the vTPM actually unlocked
+        down = time.monotonic() + 5 * 60
+        while time.monotonic() < down:
+            if ssh_in_container(client_ip, "true", check=False).returncode != 0:
+                break
+            time.sleep(5)
+        ok, end = False, time.monotonic() + 15 * 60
+        while time.monotonic() < end:
+            if ssh_in_container(client_ip, "true", check=False).returncode == 0:
+                ok = True
+                break
+            time.sleep(15)
+        if not ok:
+            die("Node unreachable after the enrollment reboot — the vTPM "
+                "auto-unlock failed (node blocked on the LUKS passphrase "
+                "prompt? console: `virsh console` / VNC).")
+        log("Encrypt: vTPM auto-unlock verified (node rebooted unattended)")
+
     script = open(os.path.join(cfg.workdir, "files", "install-pve-on-debian.sh"),
                   encoding="utf-8").read()
 
@@ -646,26 +906,27 @@ def step_inventory_and_report(cfg):
           ansible_user: adminlab
           ansible_become: true
 """
-    # multi-node: keep the other entries, update this one
+    # multi-node: keep the other hosts' blocks, update this one.
+    # Line-based: split("\n        ") also matches INSIDE a host block (a
+    # 10-space sub-line starts with the 8-space separator), which used to
+    # leak the OLD keys of the re-deployed host into the inventory as
+    # duplicate entries — YAML then kept the stale ansible_host.
     inv_path = os.path.join(inv_dir, "hosts.yml")
     if os.path.isfile(inv_path):
-        kept = []
-        for block in open(inv_path, encoding="utf-8").read().split(
-                "\n        ")[1:]:
-            name = block.split(":", 1)[0].strip()
-            if name and name != cfg.node_name:
-                kept.append("        " + block.rstrip() + "\n")
+        kept = []      # blocks of other hosts: ["        name:\n", ...]
+        cur = None
+        for ln in open(inv_path, encoding="utf-8").read().splitlines():
+            m = re.match(r"^        ([\w.-]+):\s*$", ln)
+            if m:                        # host line (8 spaces)
+                if m.group(1) != cfg.node_name:
+                    cur = [ln]
+                    kept.append(cur)
+                else:
+                    cur = None           # re-deployed host: replaced
+            elif cur is not None and re.match(r"^          \S", ln):
+                cur.append(ln)           # sub-key of a kept host
         if kept:
-            inventory = (f"""all:
-  children:
-    pve_nodes:
-      hosts:
-        {cfg.node_name}:
-          ansible_host: {cfg.client_ip}
-          ansible_port: 2222
-          ansible_user: adminlab
-          ansible_become: true
-""" + "".join(kept))
+            inventory += "".join("\n".join(b) + "\n" for b in kept)
     # The container set {PXE_IP} on {PXE_BRIDGE}: the host routes to the
     # segment, direct SSH (port 2222) works from the controller.
     open(inv_path, "w", encoding="utf-8").write(inventory)
@@ -684,6 +945,10 @@ def step_inventory_and_report(cfg):
         f" pxe-client: {cfg.client_ip} — {cfg.pve_version}",
         (f"   installed from the full ISO: {cfg.iso_local}"
          if cfg.iso_mode else "   installed from the Debian netboot"),
+        ("   disk: LUKS2 encrypted — auto-unlock by the vTPM (clevis "
+         "tpm2); manual fallback = the LUKS passphrase (LUKS_PW)"
+         if cfg.encrypt else
+         "   disk: unencrypted (deploy with --encrypt for LUKS2 + vTPM)"),
         f"   Proxmox UI: docker exec -it {CONTAINER} ssh -p 2222 "
         f"-i /srv/keys/deploy_key -L 8006:{cfg.client_ip}:8006 root@{cfg.client_ip}",
         "                (from another terminal) then http://localhost:8006",
@@ -726,6 +991,18 @@ class Config:
         self.client_ip = ""
         self.pve_version = ""
         self.disk_client = ""
+        # Disk encryption (LUKS2 + vTPM auto-unlock), opt-in: --encrypt or
+        # ENCRYPT_DISK=1. LUKS_PW stays in keyslot 0 as manual fallback;
+        # LUKS_TPM_PCRS: optional clevis PCR binding ("" = none, cf.
+        # LUKS_TPM_ENROLL), e.g. "7" or "0,2,7".
+        self.encrypt = bool(args.encrypt or os.environ.get(
+            "ENCRYPT_DISK", "").strip().lower() in ("1", "true", "yes", "on"))
+        self.luks_pw = args.luks_pw or os.environ.get("LUKS_PW", "ChangeMeLuks!")
+        if self.encrypt and re.search(r'[\s"`\'\\$]', self.luks_pw):
+            die("LUKS_PW contains characters that break the unattended "
+                "enrollment/passphrase plumbing (space, quote, $, ` or \\) "
+                "— pick a passphrase without them.")
+        self.luks_tpm_pcrs = os.environ.get("LUKS_TPM_PCRS", "").strip()
         # ISO mode ("--iso" alone -> default ISO; "--iso path|URL" ->
         # provided ISO; ISO_PATH env var also accepted)
         iso_arg = args.iso
@@ -763,6 +1040,16 @@ def main() -> int:
     p.add_argument("--disk-gb", type=int, default=None)
     p.add_argument("--osd-disk-gb", type=int, default=0,
                    help="size (GB) of an additional OSD disk (default: 0 = none)")
+    p.add_argument("--encrypt", action="store_true",
+                   help="LUKS2 disk encryption of the node's root disk with "
+                        "automatic unlock by the VM's vTPM (clevis tpm2): "
+                        "swtpm required on the host; the preseed installs "
+                        "LVM-inside-LUKS, the passphrase (LUKS_PW, default "
+                        "ChangeMeLuks!) stays as manual fallback; can also "
+                        "be enabled with ENCRYPT_DISK=1")
+    p.add_argument("--luks-pw", default=None,
+                   help="LUKS passphrase of the encrypted container "
+                        "(default: env LUKS_PW or ChangeMeLuks!)")
     p.add_argument("--workdir", default=None,
                    help="workdir of the served files (default: "
                         "/mnt/DATA/ProxKnox/libvirt-work/pxe-work)")

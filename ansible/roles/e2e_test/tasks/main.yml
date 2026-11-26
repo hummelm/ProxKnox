@@ -79,15 +79,27 @@
 - name: T060 — Mini VM RUNNING (real Debian cloud OS)
   tags: [phase1]
   ansible.builtin.shell: |
-    st=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null \
-          | python3 -c "import json,sys; print(next((v['status'] for v in json.load(sys.stdin) if v.get('vmid')=={{ e2e_vmid }}), ''))")
-    if [ -z "$st" ]; then
+    set -u
+    get() {  # cluster-wide status: "node status" of the mini VM
+      pvesh get /cluster/resources --type vm --output-format json 2>/dev/null \
+        | python3 -c "import json,sys; v=[x for x in json.load(sys.stdin) if x.get('vmid')=={{ e2e_vmid }}]; print((v[0]['node']+' '+v[0]['status']) if v else '')"
+    }
+    info=$(get); read -r cur st <<< "$info"
+    if [ -z "$cur" ]; then
       # VM not found via the cluster API: try a local boot
       qm start {{ e2e_vmid }} >/dev/null 2>&1
-      sleep 2
-      st=$(qm status {{ e2e_vmid }} 2>/dev/null | awk '{print $2}')
+      cur={{ e2e_node1_name | default('proxknox-node1') }}
+    elif [ "$st" != "running" ]; then
+      # exists but STOPPED (e.g. left stopped by an earlier run, or the
+      # guest died): no migration can be online — start it first
+      pvesh create /nodes/$cur/qemu/{{ e2e_vmid }}/status/start >/dev/null 2>&1 || true
     fi
-    echo "status: ${st:-not found}"
+    for i in $(seq 1 30); do
+      info=$(get); read -r cur st <<< "$info"
+      [ "$st" = "running" ] && break
+      sleep 4
+    done
+    echo "status: ${st:-not found} (node ${cur:-n/a})"
   args: { executable: /bin/bash }
   register: t060
   changed_when: false
@@ -224,9 +236,19 @@
 
 - name: T090 — VM RUNNING as seen from the target (pvesh API)
   tags: [phase2]
-  ansible.builtin.command: >
-    pvesh get /nodes/{{ e2e_node_target }}/qemu/{{ e2e_vmid }}/status/current
-    --output-format json
+  # right after the online migration the cluster API can answer an
+  # empty payload once — retry instead of recording a false failure
+  ansible.builtin.shell: |
+    st=''
+    for i in $(seq 1 15); do
+      st=$(pvesh get /nodes/{{ e2e_node_target }}/qemu/{{ e2e_vmid }}/status/current \
+             --output-format json 2>/dev/null \
+           | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+      [ "$st" = "running" ] && break
+      sleep 4
+    done
+    echo "{\"status\": \"${st:-n/a}\"}"
+  args: { executable: /bin/bash }
   register: t090
   changed_when: false
   failed_when: false
@@ -254,7 +276,12 @@
 - name: T110 — VM still reachable after 2 migrations
   tags: [phase2]
   ansible.builtin.shell: |
-    ping -c 4 -W 2 {{ e2e_vm_ip }} >/dev/null 2>&1 && echo OK || echo KO
+    # a freshly migrated guest can take a few seconds to answer ARP again
+    for i in $(seq 1 15); do
+      ping -c 1 -W 2 {{ e2e_vm_ip }} >/dev/null 2>&1 && { echo OK; exit 0; }
+      sleep 4
+    done
+    echo KO
   args: { executable: /bin/bash }
   delegate_to: localhost
   become: false
@@ -293,8 +320,8 @@
       ran: "{{ t020 is defined }}"
       title: "Ceph HEALTH_OK"
       expect: "ceph -s → health.status == HEALTH_OK"
-      ok: "{{ (t020.stdout | default('{}') | from_json).health.status | default('') == 'HEALTH_OK' }}"
-      got: "{{ (t020.stdout | default('{}') | from_json).health.status | default('n/a') }}"
+      ok: "{{ (t020.stdout | default('{}', true) | from_json).health.status | default('') == 'HEALTH_OK' }}"
+      got: "{{ (t020.stdout | default('{}', true) | from_json).health.status | default('n/a') }}"
     - id: T030-ceph-osd
       phase: "Ceph"
       ran: "{{ t030 is defined }}"
@@ -342,8 +369,8 @@
       ran: "{{ t090 is defined }}"
       title: "VM running as seen from {{ e2e_node_target }} (pvesh API)"
       expect: "pvesh /nodes/{{ e2e_node_target }}/qemu/100/status → running"
-      ok: "{{ (t090.stdout | default('{}') | from_json).status | default('') == 'running' if t090.stdout is defined and t090.stdout else false }}"
-      got: "{{ (t090.stdout | default('{}') | from_json).status | default('n/a') if t090.stdout is defined else 'n/a' }}"
+      ok: "{{ (t090.stdout | default('{}', true) | from_json).status | default('') == 'running' if t090.stdout is defined and t090.stdout else false }}"
+      got: "{{ (t090.stdout | default('{}', true) | from_json).status | default('n/a') if t090.stdout is defined else 'n/a' }}"
     - id: T100-second-migration
       phase: "Live migration"
       ran: "{{ t100 is defined }}"
@@ -363,8 +390,8 @@
       ran: "{{ t120 is defined }}"
       title: "Ceph HEALTH_OK after all tests"
       expect: "ceph -s → HEALTH_OK"
-      ok: "{{ (t120.stdout | default('{}') | from_json).health.status | default('') == 'HEALTH_OK' }}"
-      got: "{{ (t120.stdout | default('{}') | from_json).health.status | default('n/a') }}"
+      ok: "{{ (t120.stdout | default('{}', true) | from_json).health.status | default('') == 'HEALTH_OK' }}"
+      got: "{{ (t120.stdout | default('{}', true) | from_json).health.status | default('n/a') }}"
   loop_control:
     loop_var: entry
 

@@ -61,6 +61,27 @@ phase_deploy() {
   virsh domstate pxe-client 2>/dev/null | grep -q '^running$' \
     || { virsh start pxe-client; sleep 60; }
   docker start proxknox-pxe 2>/dev/null >/dev/null || true  # segment NAT
+  # pxe-client comes from the single-node chain: NO OSD disk — Ceph needs
+  # one on every node: create + attach it (live + next boots) if missing.
+  if ! virsh domblklist pxe-client 2>/dev/null | grep -q pxe-client-osd; then
+    step "pxe-client: adding the ${OSD_GB} GB OSD disk"
+    DISK_POOL="${DISK_POOL:-libvirt-work}"   # default of the deploy tool
+    virsh vol-create-as "$DISK_POOL" pxe-client-osd.qcow2 \
+      "${OSD_GB}G" --format qcow2
+    osd_vol=$(virsh vol-path --pool "$DISK_POOL" pxe-client-osd.qcow2)
+    # attach as an EXPLICIT qcow2 disk (plain attach-disk presents a raw
+    # sparse file: the guest would see ~200 KB and OSD creation aborts)
+    osd_xml=$(mktemp)
+    printf "%s\n" \
+      "<disk type='file' device='disk'>" \
+      "  <driver name='qemu' type='qcow2' cache='none' discard='unmap'/>" \
+      "  <source file='$osd_vol'/>" \
+      "  <target dev='vdb' bus='virtio'/>" \
+      "</disk>" > "$osd_xml"
+    virsh attach-device pxe-client "$osd_xml" --config
+    virsh attach-device pxe-client "$osd_xml" --live
+    rm -f "$osd_xml"
+  fi
   virsh dominfo "$NODE2" >/dev/null 2>&1 || deploy_node "$NODE2" "$NODE2_MAC"
   virsh dominfo "$NODE3" >/dev/null 2>&1 || deploy_node "$NODE3" "$NODE3_MAC"
   step "3 nodes deployed (pxe-client, $NODE2, $NODE3)"

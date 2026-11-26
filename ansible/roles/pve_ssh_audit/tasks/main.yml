@@ -7,7 +7,7 @@
   # The rest of the ssh-audit profile remains active (hardened KEX/Ciphers/MACs).
   ansible.builtin.lineinfile:
     path: /etc/ssh/sshd_config
-    regexp: '^(?i)\s*DisableForwarding\s+yes\s*$'
+    regexp: '(?i)^\s*DisableForwarding\s+yes\s*$'
     state: absent
   register: _sshaudit_nofwd
 

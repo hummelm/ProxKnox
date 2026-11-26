@@ -16,6 +16,7 @@
 # Usage:
 #   ./tools/full-chain.sh                       # netboot + full hardening
 #   ./tools/full-chain.sh --iso                 # from the DVD-1 ISO (no d-i updates)
+#   ./tools/full-chain.sh --encrypt             # LUKS2 disk (vTPM auto-unlock)
 #   ./tools/full-chain.sh --bootstrap           # (re)install galaxy first
 #   ./tools/full-chain.sh --skip-deploy         # node already deployed
 #   ./tools/full-chain.sh --skip-pve-hardening / --skip-cis
@@ -23,7 +24,8 @@
 #   ./tools/full-chain.sh --check               # only check prerequisites
 #
 # Env    : ROOT_PW, ADMIN_PW, SSH_PUBKEY_FILE, DISK_POOL, WORKDIR, ISO_PATH,
-#          ISO_URL (cf. deploy/pxe_deploy_container.py --help)
+#          ISO_URL (cf. deploy/pxe_deploy_container.py --help); ENCRYPT_DISK=1,
+#          LUKS_PW, LUKS_TPM_PCRS (--encrypt / disk encryption)
 #
 # The lab is left running at the end of the chain.
 set -euo pipefail
@@ -39,10 +41,12 @@ export ANSIBLE_STDOUT_CALLBACK="${ANSIBLE_STDOUT_CALLBACK:-default}"
 unset LD_LIBRARY_PATH
 
 ISO_ARGS=()
+ENCRYPT=0
 RUN_DEPLOY=1 RUN_PVE=1 RUN_CIS=1 BOOTSTRAP=0 CHECK=0
 for arg in "$@"; do
   case "$arg" in
     --iso)             ISO_ARGS+=(--iso);;
+    --encrypt)         ENCRYPT=1;;
     --bootstrap)       BOOTSTRAP=1;;
     --skip-deploy)     RUN_DEPLOY=0;;
     --skip-pve-hardening) RUN_PVE=0;;
@@ -64,6 +68,10 @@ for c in python3 ansible-playbook virsh virt-install docker wget; do
 done
 if [ ${#ISO_ARGS[@]} -gt 0 ]; then
   command -v xorriso >/dev/null 2>&1 || missing+=(xorriso)
+fi
+if [ "$ENCRYPT" = 1 ]; then
+  command -v swtpm >/dev/null 2>&1 || missing+=(swtpm)
+  command -v swtpm_setup >/dev/null 2>&1 || missing+=(swtpm-tools)
 fi
 [ ${#missing[@]} -gt 0 ] && fatal "missing commands: ${missing[*]}"
 
@@ -92,8 +100,10 @@ fi
 
 # ------------------------------------------------------------- 1. deployment ---
 if [ "$RUN_DEPLOY" -eq 1 ]; then
-  step "1/4 Deployment: pxe_deploy_container.py ${ISO_ARGS[*]:-}"
-  python3 deploy/pxe_deploy_container.py "${ISO_ARGS[@]}"
+  ENCRYPT_ARG=()
+  if [ "$ENCRYPT" = 1 ]; then ENCRYPT_ARG=(--encrypt); fi
+  step "1/4 Deployment: pxe_deploy_container.py ${ISO_ARGS[*]:-} ${ENCRYPT_ARG[*]:-}"
+  python3 deploy/pxe_deploy_container.py "${ISO_ARGS[@]}" "${ENCRYPT_ARG[@]}"
 else
   step "1/4 Deployment: SKIPPED (--skip-deploy / --reports-only)"
 fi
@@ -117,10 +127,12 @@ fi
 # ------------------------------------------------------------ 4. reports ---
 step "4/4 Consolidated report (md + html)"
 # PVE_VERSION can be set to override the version shown in the report
+ENCRYPT_TAG=""
+[ "$ENCRYPT" = 1 ] && ENCRYPT_TAG=" (disk: LUKS2 + vTPM)" || true
 python3 tools/audit-report.py --audit-dir ansible/audit-summaries \
   --node "${NODE:-pxe-client}" \
   --pve "${PVE_VERSION:-pve-manager/9.x}" \
-  --chain "deployment ${ISO_ARGS[*]:-netboot} → Proxmox VE 9.2 → harden-pve.yml (HSE + Ceph, guides ON by default) → site.yml (CIS L2) → syver + pve_audit"
+  --chain "deployment ${ISO_ARGS[*]:-netboot}${ENCRYPT_TAG} → Proxmox VE 9.2 → harden-pve.yml (HSE + Ceph, guides ON by default) → site.yml (CIS L2) → syver + pve_audit"
 
 step "Chain complete. Reports:"
 ls -1 docs/runs/report-audit-cis-debian13-pve_*.md 2>/dev/null | tail -2 || true

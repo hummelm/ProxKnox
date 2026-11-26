@@ -21,6 +21,8 @@ From a local Linux machine, with no server VM and no manual preparation:
 | CIS L2 audit — 19/11/2026 | **304 failures → 14** out of 891 controls (**97.5 %** compliance); 8 controls manual by design |
 | PVE hardening audit — 19/11/2026 | **0 deviations** (`pve_audit` role, 20 JSON controls) |
 | Cluster E2E test — 24/11/2026 | **12/12 pass** — 2 live migrations (9-10 s), **0 lost ping responses** (44 samples at 200 ms), Ceph `HEALTH_OK` before/after |
+| Encrypted chain (`--encrypt`) — 25/11/2026 | Same chain with **LUKS2 + vTPM auto-unlock** (HSE § 1.2.1): unattended boots verified at every reboot, audit unchanged — CIS 304 → 14 (**97.5 %**), 0 PVE deviation, 0 reachable gap closed: stolen/vanished disk no longer exposes data at rest |
+| Encrypted cluster E2E (`ENCRYPT_DISK=1`) — 25/11/2026 | **12/12 pass on 3 encrypted nodes** — quorum 3/3, Ceph `HEALTH_OK` (3 OSDs, hardened), 2 online migrations (~9 s) with the VM pinging throughout, `vmstorage` on RBD |
 
 Reports are versioned in [`docs/runs/`](docs/runs/) — source JSON (not
 versioned) lives in `ansible/audit-summaries/`.
@@ -36,12 +38,13 @@ versioned) lives in `ansible/audit-summaries/`.
 ## The chain at a glance
 
 ```
-  tools/full-chain.sh [--iso] [--bootstrap]
+  tools/full-chain.sh [--iso] [--encrypt] [--bootstrap]
   │
   ├─ 1. DEPLOYMENT   deploy/pxe_deploy_container.py [--iso] [--client …]
   │     libvirt network “pxe-lab” → Docker container proxknox-pxe
   │     (DHCP + TFTP + DNS + HTTP :8000 + NAT, host netns)
   │     → VM installed by Debian-installer (preseed, NO updates in --iso mode)
+  │     → [--encrypt] LUKS2 disk + TPM auto-unlock (vTPM, clevis tpm2)
   │     → Proxmox VE 9.2 conversion (deploy/install-pve-on-debian.sh, 2 phases)
   │     → ansible/inventory/hosts.yml
   ├─ 2. PVE HARDENING ansible/harden-pve.yml — HomeSecExplorer guide v0.9.2
@@ -70,6 +73,10 @@ git clone https://github.com/hummelm/ProxKnox && cd ProxKnox
 ./tools/full-chain.sh --iso --bootstrap   # ~50-60 min with the ISO already cached
 ./tools/full-chain.sh --iso               # subsequent runs (~50 min)
 
+# 2bis. encrypted node: LUKS2 disk, auto-unlocked at every reboot by the
+#      VM's vTPM (needs swtpm + swtpm-tools on the host)
+./tools/full-chain.sh --iso --encrypt
+
 # 3. use the result (hardened node, SSH port 2222)
 IP=$(grep -m1 ansible_host ansible/inventory/hosts.yml | awk '{print $2}')
 ssh -p 2222 adminlab@$IP                        # adminlab, sudo NOPASSWD
@@ -85,6 +92,7 @@ ssh -p 2222 -L 8006:$IP:8006 adminlab@$IP       # UI: https://localhost:8006
 | Need | Command |
 |---|---|
 | Classic network deployment (Debian mirror) | `./tools/full-chain.sh` |
+| Node with **encrypted disk** (LUKS2 + vTPM auto-unlock, HSE § 1.2.1) | `./tools/full-chain.sh --iso --encrypt` |
 | Node already deployed: (re)hardening + audit | `./tools/full-chain.sh --skip-deploy` |
 | PVE hardening only (no CIS Lockdown) | `./tools/full-chain.sh --skip-deploy --skip-cis` |
 | CIS Lockdown only (no PVE hardening) | `./tools/full-chain.sh --skip-deploy --skip-pve-hardening` |
@@ -172,6 +180,9 @@ documented Proxmox deviations in `group_vars/pve_nodes.yml`:
 | `DISK_POOL` | `libvirt-work` | disk pool of the VM |
 | `WORKDIR` | `libvirt-work/pxe-work` | served files (TFTP, preseed, ISO, logs) |
 | `ISO_PATH` / `ISO_URL` | DVD-1 cdimage (13.7.0) | full ISO (`--iso` mode), SHA-256 verified |
+| `ENCRYPT_DISK` | empty | `1` = LUKS2 disk encryption with vTPM auto-unlock (idem `--encrypt`) |
+| `LUKS_PW` | `ChangeMeLuks!` | LUKS passphrase (manual fallback keyslot; override before the lab leaves your machine) |
+| `LUKS_TPM_PCRS` | empty | optional TPM PCR binding (see [`docs/full-chain.md` § 4.2](docs/full-chain.md#42-disk-encryption---encrypt-luks2--vtpm-auto-unlock)) |
 | `WAIT_SSH_MAX_MIN` | `60` | max wait (min) for the client to come up on SSH |
 | `CLIENT_NAME`, `CLIENT_MAC` | `pxe-client`, `52:54:00:aa:00:10` | identity of the deployed node (overridable via `--client` / `--mac`) |
 
@@ -229,7 +240,7 @@ disks, TFTP, preseeds, cached ISO, logs (including `dnsmasq.leases`,
 | UI certificates (ACME/PKI, `pvenode cert set`) | HSE § 2.3.1/2.3.2 |
 | 3-2-1 backups + restore testing | HSE § 4.x |
 | Centralized monitoring (Prometheus/Grafana) | HSE § 5.2.x |
-| Secure Boot + disk encryption (before production use) | HSE § 1.1.5/1.2.1 |
+| Secure Boot (disk encryption itself: automated via `--encrypt`, [`docs` § 4.2](docs/full-chain.md#42-disk-encryption---encrypt-luks2--vtpm-auto-unlock)) | HSE § 1.1.5 |
 | Review of the CIS report’s “Manual Check Required” items | report § residual failures |
 
 ## Jump to… (documentation index)
@@ -238,6 +249,7 @@ disks, TFTP, preseeds, cached ISO, logs (including `dnsmasq.leases`,
 |---|---|
 | Detailed prerequisites (nested virtualization, packages) | [`docs/full-chain.md` § 2](docs/full-chain.md#2-prerequisites-controller--local-linux-machine) |
 | Netboot / ISO modes, options, environment variables | [`docs/full-chain.md` § 3-4](docs/full-chain.md#3-operating-mode) |
+| Disk encryption — LUKS2 + vTPM auto-unlock (`--encrypt`) | [`docs/full-chain.md` § 4.2](docs/full-chain.md#42-disk-encryption---encrypt-luks2--vtpm-auto-unlock) |
 | Hardening: 12 PVE roles, documented CIS deviations | [`docs/full-chain.md` § 5](docs/full-chain.md#5-hardening) |
 | Audit → reports (md/html, embedded JSON) | [`docs/full-chain.md` § 6](docs/full-chain.md#6-audit--reports) |
 | 3-node cluster E2E test (Ceph, migrations) | [`docs/full-chain.md` § 6bis](docs/full-chain.md#6bis-end-to-end-3-node-cluster-test-ceph--live-migration) |
@@ -252,7 +264,8 @@ disks, TFTP, preseeds, cached ISO, logs (including `dnsmasq.leases`,
   system**: intended for a lab — evaluate every control before production.
 - `PermitRootLogin` restricted by CIS: administration via `adminlab`
   (sudo NOPASSWD) or SSH keys.
-- Default lab passwords (`ChangeMeRoot!`/`ChangeMeAdmin!`): override them
-  (`ROOT_PW`/`ADMIN_PW`) as soon as the lab leaves your machine.
+- Default lab passwords (`ChangeMeRoot!`/`ChangeMeAdmin!`/`ChangeMeLuks!`):
+  override them (`ROOT_PW`/`ADMIN_PW`/`LUKS_PW`) as soon as the lab
+  leaves your machine.
 - Some controls remain manual by nature (2FA, BIOS/hardware, backups) —
   see § 7 above.

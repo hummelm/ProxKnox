@@ -1,0 +1,189 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>E2E tests — ProxKnox cluster (3 nodes)</title>
+<style>
+:root{color-scheme:light dark}
+body{font-family:-apple-system,'Segoe UI',Roboto,sans-serif;margin:2rem auto;
+max-width:1150px;color:#1a1a1a;line-height:1.45;background:#fafafa}
+@media (prefers-color-scheme:dark){body{background:#141414;color:#ddd}
+th{background:#242424!important}details summary:hover{background:#242424}}
+h1{border-bottom:3px solid #1565c0;padding-bottom:.3rem}
+h2{border-bottom:1px solid #ddd;padding-bottom:.2rem;margin-top:2rem}
+table{border-collapse:collapse;width:100%;margin:.8rem 0;font-size:.88rem}
+th,td{border:1px solid #ccc;padding:.45rem .6rem;text-align:left;vertical-align:top}
+th{background:#f0f0f0} code{background:#f0f0f0;padding:.1rem .3rem;border-radius:3px}
+.meta{color:#555;font-size:.9rem}.cards{display:flex;flex-wrap:wrap;gap:1rem;margin:1.5rem 0}
+.card{flex:1 1 200px;background:#fff;border:1px solid #ddd;border-radius:8px;
+padding:.9rem 1.1rem;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.card h3{margin:0 0 .4rem;font-size:.85rem;text-transform:uppercase;
+letter-spacing:.04em;color:#666}.card .big{font-size:1.7rem;font-weight:700}
+.card .sub{font-size:.8rem;color:#777}
+.pass{color:#2e7d32;font-weight:600}.fail{color:#c62828;font-weight:600}
+.badge{display:inline-block;border-radius:4px;padding:.1rem .5rem;
+font-weight:600;color:#fff;font-size:.85rem}.b-pass{background:#2e7d32}
+.b-fail{background:#c62828}.b-neutral{background:#616161}
+details{border:1px solid #ddd;border-radius:6px;margin:.45rem 0;background:#fff}
+details summary{cursor:pointer;padding:.55rem .8rem;font-weight:500;
+list-style:none;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+details summary::-webkit-details-marker{display:none}
+details summary::before{content:"▸";font-size:.9rem;color:#888}
+details[open] summary::before{transform:rotate(90deg)}
+details summary:hover{background:#f2f2f2}
+details .body{padding:.6rem .9rem;border-top:1px solid #eee;font-size:.9rem}
+.kv{font-size:.85rem;color:#555;margin:.15rem 0}
+.tab{white-space:pre;overflow:auto;font-size:.78rem;background:#f5f5f5;
+padding:.6rem;border-radius:4px;max-height:22rem}
+.count{font-variant-numeric:tabular-nums;color:#888;font-size:.8rem}
+footer{margin-top:2.5rem;padding-top:.8rem;border-top:1px solid #ddd;
+color:#888;font-size:.8rem}
+</style></head><body>
+<h1>End-to-End tests — ProxKnox cluster (3 nodes)</h1>
+<p class="meta"><strong>Scenario</strong>: 3-node Proxmox VE 9.2 lab cluster: PXE deployment, corosync cluster, Ceph (1 OSD/node), mini VM 1 vCPU/2 GB on RBD, live migrations with downtime measurement<br>
+<strong>Nodes</strong>: proxknox-node1 (pxe-client) · proxknox-node2 (pxe-node2) · proxknox-node3 (pxe-node3) ·
+<strong>Date</strong>: 2026-11-25T16:20:10Z<br>
+<strong>Disks</strong>: LUKS2 + vTPM auto-unlock (all nodes)</p>
+<div class="cards"><div class="card"><h3>E2E tests</h3><div class="big">12/12</div><div class="sub">tests passed</div></div><div class="card"><h3>Verdict</h3><div class="big pass">PASS</div><div class="sub">0 failure(s)</div></div><div class="card"><h3>Lab</h3><div class="big">3 nodes</div><div class="sub">PXE → cluster → Ceph → migrations</div></div><div class="card"><h3>Disks</h3><div class="big">LUKS2 + vTPM</div><div class="sub">auto-unlock (clevis tpm2) on every node</div></div><div class="card"><h3>Migrations</h3><div class="big">9 + 9 s</div><div class="sub">live-migration durations</div></div><div class="card"><h3>Ping loss</h3><div class="big">0</div><div class="sub">missing ping responses during the migration (200 ms/interval)</div></div></div>
+<h2>Per-phase detail (click to expand)</h2>
+<details open><summary><b>Cluster</b> <span class="count">1/1 passed</span></summary><div class="body"><details><summary><span class="badge b-pass">pass</span><b>T010-quorum-3</b> — 3-vote corosync quorum<span class="count">pvecm status → Quorum: 3 votes</span></summary><div class="body"><p class="kv"><b>Expected</b>: pvecm status → Quorum: 3 votes</p><p class="kv"><b>Got</b>: <code>Cluster information ------------------- Name:             proxknox-lab Config Version:   …</code></p></div></details></div></details><details open><summary><b>Ceph</b> <span class="count">3/3 passed</span></summary><div class="body"><details><summary><span class="badge b-pass">pass</span><b>T020-ceph-health</b> — Ceph HEALTH_OK<span class="count">ceph -s → health.status == HEALTH_OK</span></summary><div class="body"><p class="kv"><b>Expected</b>: ceph -s → health.status == HEALTH_OK</p><p class="kv"><b>Got</b>: <code>HEALTH_OK</code></p></div></details><details><summary><span class="badge b-pass">pass</span><b>T030-ceph-osd</b> — At least 3 OSDs (one per node)<span class="count">len(ceph osd dump .osds) &gt;= 3</span></summary><div class="body"><p class="kv"><b>Expected</b>: len(ceph osd dump .osds) &gt;= 3</p><p class="kv"><b>Got</b>: <code>3 OSD</code></p></div></details><details><summary><span class="badge b-pass">pass</span><b>T040-ceph-hardened</b> — Ceph hardening applied (msgr2 secure + cephx)<span class="count">pve_ceph role: auth_*_required + ms_*_mode secure in ceph.conf</span></summary><div class="body"><p class="kv"><b>Expected</b>: pve_ceph role: auth_*_required + ms_*_mode secure in ceph.conf</p><p class="kv"><b>Got</b>: <code></code></p></div></details></div></details><details open><summary><b>Mini VM</b> <span class="count">3/3 passed</span></summary><div class="body"><details><summary><span class="badge b-pass">pass</span><b>T050-vm-deployed</b> — Mini VM deployed (1 CPU / 2 GB / RBD disk)<span class="count">qm create 100 + importdisk of the Debian 13 cloud image</span></summary><div class="body"><p class="kv"><b>Expected</b>: qm create 100 + importdisk of the Debian 13 cloud image</p><p class="kv"><b>Got</b>: <code>VM 100 already deployed (on proxknox-node2)</code></p></div></details><details><summary><span class="badge b-pass">pass</span><b>T060-vm-booted</b> — Mini VM started (real OS boot)<span class="count">qm status 100 → running</span></summary><div class="body"><p class="kv"><b>Expected</b>: qm status 100 → running</p><p class="kv"><b>Got</b>: <code>status: running (node proxknox-node2)</code></p></div></details><details><summary><span class="badge b-pass">pass</span><b>T070-vm-ping</b> — Mini VM reachable before migration<span class="count">ping OK to 192.168.200.192 (cloud-init static IP)</span></summary><div class="body"><p class="kv"><b>Expected</b>: ping OK to 192.168.200.192 (cloud-init static IP)</p><p class="kv"><b>Got</b>: <code>ping to 192.168.200.192 → OK</code></p></div></details></div></details><details open><summary><b>Live migration</b> <span class="count">4/4 passed</span></summary><div class="body"><details><summary><span class="badge b-pass">pass</span><b>T080-live-migration</b> — Live migration node1 → proxknox-node2 + ping downtime<span class="count">continuous ping during qm migrate --online: ~0 losses, VM running on the target</span></summary><div class="body"><p class="kv"><b>Expected</b>: continuous ping during qm migrate --online: ~0 losses, VM running on the target</p><p class="kv"><b>Got</b>: <code>PING sent=41 lost=0 MigDur=9s vm_ip=192.168.200.192</code></p></div></details><details><summary><span class="badge b-pass">pass</span><b>T090-vm-running-target</b> — VM running as seen from proxknox-node2 (pvesh API)<span class="count">pvesh /nodes/proxknox-node2/qemu/100/status → running</span></summary><div class="body"><p class="kv"><b>Expected</b>: pvesh /nodes/proxknox-node2/qemu/100/status → running</p><p class="kv"><b>Got</b>: <code>running</code></p></div></details><details><summary><span class="badge b-pass">pass</span><b>T100-second-migration</b> — Second live migration → proxknox-node3<span class="count">qm migrate --online; VM running on target 2</span></summary><div class="body"><p class="kv"><b>Expected</b>: qm migrate --online; VM running on target 2</p><p class="kv"><b>Got</b>: <code>MigDur=9s</code></p></div></details><details><summary><span class="badge b-pass">pass</span><b>T110-vm-healthy</b> — VM still reachable after 2 migrations<span class="count">ping OK after migrations</span></summary><div class="body"><p class="kv"><b>Expected</b>: ping OK after migrations</p><p class="kv"><b>Got</b>: <code>ping → OK</code></p></div></details></div></details><details open><summary><b>Conclusion</b> <span class="count">1/1 passed</span></summary><div class="body"><details><summary><span class="badge b-pass">pass</span><b>T120-ceph-final</b> — Ceph HEALTH_OK after all tests<span class="count">ceph -s → HEALTH_OK</span></summary><div class="body"><p class="kv"><b>Expected</b>: ceph -s → HEALTH_OK</p><p class="kv"><b>Got</b>: <code>HEALTH_OK</code></p></div></details></div></details>
+<h2>Validated end-to-end scenario</h2>
+<details><summary>The complete journey</summary><div class="body">
+<ol>
+<li><b>Deployment</b>: 3 Debian 13 nodes installed via real PXE
+(Docker container providing DHCP/TFTP/HTTP/NAT), one dedicated OSD disk
+per node, converted to Proxmox VE 9.2. Nodes deployed with disk encryption: every root LUKS2 container auto-unlocked by its vTPM (clevis tpm2) — proven by the unattended enrollment reboot.</li>
+<li><b>Network</b>: static vmbr0 (192.168.200.11/12/13), hostnames
+proxknox-node1/2/3 — a stable base for corosync/Ceph.</li>
+<li><b>Cluster</b>: <code>pvecm create/add</code> — 3-vote quorum.</li>
+<li><b>Ceph</b>: <code>pveceph init</code> + 1 OSD/node + <code>vmstorage</code>
+pool (size 3/min_size 2) — HEALTH_OK, "secure" msgr2 (cephx required
+everywhere, encrypted traffic).</li>
+<li><b>Hardening</b>: harden-pve.yml (12 roles ON, with cluster/Ceph rules
+in the PVE firewall) on all 3 nodes.</li>
+<li><b>Mini VM</b>: 1 vCPU / 2 GiB, disk on Ceph RBD, a real Debian 13
+cloud image (lab-segment DHCP), started then pinged.</li>
+<li><b>Live migrations</b>: node1→node2 then node2→node3, continuous ping
+(200 ms) — the VM stays reachable, downtime measured.</li>
+</ol></div></details>
+<h2>Source data (embedded JSON)</h2>
+<details><summary>Expand raw JSON e2e-cluster-test_1795623610.json</summary>
+<div class="body"><div class="tab">{
+ "test-suite": "e2e-cluster-proxknox",
+ "scenario": "3-node Proxmox VE 9.2 lab cluster: PXE deployment, corosync cluster, Ceph (1 OSD/node), mini VM 1 vCPU/2 GB on RBD, live migrations with downtime measurement",
+ "node": "pxe-client",
+ "lab-nodes": [
+  "proxknox-node1 (pxe-client)",
+  "proxknox-node2 (pxe-node2)",
+  "proxknox-node3 (pxe-node3)"
+ ],
+ "date": "2026-11-25T16:20:10Z",
+ "epoch": 1795623610,
+ "summary": {
+  "test-count": 12,
+  "passed-count": 12,
+  "failed-count": 0,
+  "notrun-count": 0,
+  "summary-line": "Count: 12, Failed: 0, NotRun: 0"
+ },
+ "results": [
+  {
+   "id": "T010-quorum-3",
+   "phase": "Cluster",
+   "title": "3-vote corosync quorum",
+   "expect": "pvecm status → Quorum: 3 votes",
+   "status": "pass",
+   "got": "Cluster information ------------------- Name:             proxknox-lab Config Version:   …"
+  },
+  {
+   "id": "T020-ceph-health",
+   "phase": "Ceph",
+   "title": "Ceph HEALTH_OK",
+   "expect": "ceph -s → health.status == HEALTH_OK",
+   "status": "pass",
+   "got": "HEALTH_OK"
+  },
+  {
+   "id": "T030-ceph-osd",
+   "phase": "Ceph",
+   "title": "At least 3 OSDs (one per node)",
+   "expect": "len(ceph osd dump .osds) &gt;= 3",
+   "status": "pass",
+   "got": "3 OSD"
+  },
+  {
+   "id": "T040-ceph-hardened",
+   "phase": "Ceph",
+   "title": "Ceph hardening applied (msgr2 secure + cephx)",
+   "expect": "pve_ceph role: auth_*_required + ms_*_mode secure in ceph.conf",
+   "status": "pass",
+   "got": ""
+  },
+  {
+   "id": "T050-vm-deployed",
+   "phase": "Mini VM",
+   "title": "Mini VM deployed (1 CPU / 2 GB / RBD disk)",
+   "expect": "qm create 100 + importdisk of the Debian 13 cloud image",
+   "status": "pass",
+   "got": "VM 100 already deployed (on proxknox-node2)"
+  },
+  {
+   "id": "T060-vm-booted",
+   "phase": "Mini VM",
+   "title": "Mini VM started (real OS boot)",
+   "expect": "qm status 100 → running",
+   "status": "pass",
+   "got": "status: running (node proxknox-node2)"
+  },
+  {
+   "id": "T070-vm-ping",
+   "phase": "Mini VM",
+   "title": "Mini VM reachable before migration",
+   "expect": "ping OK to 192.168.200.192 (cloud-init static IP)",
+   "status": "pass",
+   "got": "ping to 192.168.200.192 → OK"
+  },
+  {
+   "id": "T080-live-migration",
+   "phase": "Live migration",
+   "title": "Live migration node1 → proxknox-node2 + ping downtime",
+   "expect": "continuous ping during qm migrate --online: ~0 losses, VM running on the target",
+   "status": "pass",
+   "got": "PING sent=41 lost=0 MigDur=9s vm_ip=192.168.200.192"
+  },
+  {
+   "id": "T090-vm-running-target",
+   "phase": "Live migration",
+   "title": "VM running as seen from proxknox-node2 (pvesh API)",
+   "expect": "pvesh /nodes/proxknox-node2/qemu/100/status → running",
+   "status": "pass",
+   "got": "running"
+  },
+  {
+   "id": "T100-second-migration",
+   "phase": "Live migration",
+   "title": "Second live migration → proxknox-node3",
+   "expect": "qm migrate --online; VM running on target 2",
+   "status": "pass",
+   "got": "MigDur=9s"
+  },
+  {
+   "id": "T110-vm-healthy",
+   "phase": "Live migration",
+   "title": "VM still reachable after 2 migrations",
+   "expect": "ping OK after migrations",
+   "status": "pass",
+   "got": "ping → OK"
+  },
+  {
+   "id": "T120-ceph-final",
+   "phase": "Conclusion",
+   "title": "Ceph HEALTH_OK after all tests",
+   "expect": "ceph -s → HEALTH_OK",
+   "status": "pass",
+   "got": "HEALTH_OK"
+  }
+ ],
+ "_path": "ansible/audit-summaries/e2e-cluster-test_1795623610.json"
+}</div></div></details>
+<footer>Generated by <code>tools/e2e-report.py</code> — single page, no
+dependencies. Source: <code>e2e-cluster-test_1795623610.json</code> → docs/runs/report-e2e-cluster_2026-11-25.html</footer>
+</body></html>

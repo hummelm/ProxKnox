@@ -4,7 +4,7 @@
 
 Depuis une machine Linux locale, sans VM serveur ni préparation manuelle :
 
-- `./tools/chaine-complete.sh --iso` produit un **nœud Proxmox VE 9.2 durci**
+- `./tools/full-chain.sh --iso` produit un **nœud Proxmox VE 9.2 durci**
   (12 rôles de hardening selon le guide HomeSecExplorer PVE9 + benchmark
   **CIS Debian 13 Level 2** via `ansible-lockdown.DEBIAN13-CIS`, pinné 1.1.0)
   et un **rapport d'audit consolidé** (md + html) ;
@@ -19,11 +19,13 @@ Depuis une machine Linux locale, sans VM serveur ni préparation manuelle :
 | Audit CIS L2 — 19/11/2026 | **304 échecs → 14** sur 891 contrôles (**97,5 %** de conformité) ; 8 contrôles manuels par conception |
 | Audit hardening PVE — 19/11/2026 | **0 écart** (rôle `pve_audit`, 20 contrôles json) |
 | Test E2E cluster — 24/11/2026 | **12/12 pass** — 2 live-migrations (9-10 s), **0 réponse ping perdue** (44 échantillons à 200 ms), Ceph `HEALTH_OK` avant/après |
+| Chaîne chiffrée (`--encrypt`) — 25/11/2026 | Même chaîne avec **LUKS2 + déverrouillage vTPM** (HSE § 1.2.1) : boots sans intervention vérifiés à chaque redémarrage, audit inchangé — CIS 304 → 14 (**97,5 %**), 0 écart PVE ; la protection de repos (HSE 1.2.1) est acquise : un disque volé/disparu n'expose plus ses données |
+| E2E cluster chiffré (`ENCRYPT_DISK=1`) — 25/11/2026 | **12/12 pass sur 3 nœuds chiffrés** — quorum 3/3, Ceph `HEALTH_OK` (3 OSD, durci), 2 migrations à chaud (~9 s) avec la VM pingée en continu, `vmstorage` sur RBD |
 
 Rapports versionnés dans [`docs/runs/`](docs/runs/) — sources JSON (non
 versionnées) dans `ansible/audit-summaries/`.
 
-> Référence détaillée : **[`docs/chaine-complete.md`](docs/chaine-complete.md)** —
+> Référence détaillée : **[`docs/full-chain.md`](docs/full-chain.md)** —
 > prérequis, modes de déploiement, hardening, rapports, dépannage (constatés sur
 > runs réels). Annexe : [`docs/analyse-ansible.md`](docs/analyse-ansible.md)
 > (faisabilité d'une refonte du déploiement en Ansible).
@@ -33,12 +35,13 @@ versionnées) dans `ansible/audit-summaries/`.
 ## La chaîne en un coup d'œil
 
 ```
-  tools/chaine-complete.sh [--iso] [--bootstrap]
+  tools/full-chain.sh [--iso] [--encrypt] [--bootstrap]
   │
   ├─ 1. DÉPLOIEMENT   deploy/pxe_deploy_container.py [--iso] [--client …]
   │     réseau libvirt « pxe-lab » → conteneur Docker proxknox-pxe
   │     (DHCP + TFTP + DNS + HTTP :8000 + NAT, netns hôte)
   │     → VM installée par Debian-installer (preseed, SANS màj en mode --iso)
+  │     → [--encrypt] disque LUKS2 + déverrouillage TPM (vTPM, clevis tpm2)
   │     → conversion Proxmox VE 9.2 (deploy/install-pve-on-debian.sh, 2 phases)
   │     → ansible/inventory/hosts.yml
   ├─ 2. HARDENING PVE ansible/harden-pve.yml — guide HomeSecExplorer v0.9.2
@@ -61,11 +64,15 @@ versionnées) dans `ansible/audit-summaries/`.
 ```bash
 # 1. cloner et vérifier les prérequis (KVM imbriqué, Docker, libvirt, Ansible)
 git clone https://github.com/hummelm/ProxKnox && cd ProxKnox
-./tools/chaine-complete.sh --check
+./tools/full-chain.sh --check
 
 # 2. lancer la chaîne complète — 1er run : --bootstrap installe les rôles
-./tools/chaine-complete.sh --iso --bootstrap   # ~50-60 min avec l'ISO en cache
-./tools/chaine-complete.sh --iso               # runs suivants (~50 min)
+./tools/full-chain.sh --iso --bootstrap   # ~50-60 min avec l'ISO en cache
+./tools/full-chain.sh --iso               # runs suivants (~50 min)
+
+# 2bis. nœud chiffré : disque LUKS2, déverrouillé automatiquement à chaque
+#       reboot par le vTPM de la VM (swtpm + swtpm-tools requis sur l'hôte)
+./tools/full-chain.sh --iso --encrypt
 
 # 3. utiliser le résultat (nœud durci, SSH port 2222)
 IP=$(grep -m1 ansible_host ansible/inventory/hosts.yml | awk '{print $2}')
@@ -73,20 +80,21 @@ ssh -p 2222 adminlab@$IP                        # adminlab, sudo NOPASSWD
 ssh -p 2222 -L 8006:$IP:8006 adminlab@$IP       # UI : https://localhost:8006
 
 # utiles ensuite
-./tools/chaine-complete.sh --reports-only       # regénérer les rapports
-./tools/chaine-complete.sh --skip-deploy        # re-hardening + audit seulement
+./tools/full-chain.sh --reports-only       # regénérer les rapports
+./tools/full-chain.sh --skip-deploy        # re-hardening + audit seulement
 ```
 
 ### Variantes de la chaîne
 
 | Besoin | Commande |
 |---|---|
-| Déploiement réseau classique (miroir Debian) | `./tools/chaine-complete.sh` |
-| Nœud déjà déployé : (re)hardening + audit | `./tools/chaine-complete.sh --skip-deploy` |
-| Hardening PVE seul (sans CIS Lockdown) | `./tools/chaine-complete.sh --skip-deploy --skip-cis` |
-| CIS Lockdown seul (sans hardening PVE) | `./tools/chaine-complete.sh --skip-deploy --skip-pve-hardening` |
-| Rapport d'audit uniquement | `./tools/chaine-complete.sh --reports-only` |
-| Vérifier les prérequis | `./tools/chaine-complete.sh --check` |
+| Déploiement réseau classique (miroir Debian) | `./tools/full-chain.sh` |
+| Nœud à **disque chiffré** (LUKS2 + déverrouillage vTPM, HSE § 1.2.1) | `./tools/full-chain.sh --iso --encrypt` |
+| Nœud déjà déployé : (re)hardening + audit | `./tools/full-chain.sh --skip-deploy` |
+| Hardening PVE seul (sans CIS Lockdown) | `./tools/full-chain.sh --skip-deploy --skip-cis` |
+| CIS Lockdown seul (sans hardening PVE) | `./tools/full-chain.sh --skip-deploy --skip-pve-hardening` |
+| Rapport d'audit uniquement | `./tools/full-chain.sh --reports-only` |
+| Vérifier les prérequis | `./tools/full-chain.sh --check` |
 
 ---
 
@@ -168,12 +176,15 @@ cadrés et documentés dans `group_vars/pve_nodes.yml` :
 | `DISK_POOL` | `libvirt-work` | pool disque de la VM |
 | `WORKDIR` | `libvirt-work/pxe-work` | fichiers servis (TFTP, preseed, ISO, logs) |
 | `ISO_PATH` / `ISO_URL` | DVD-1 cdimage (13.7.0) | ISO complète (mode `--iso`), SHA-256 vérifiée |
+| `ENCRYPT_DISK` | vide | `1` = chiffrement disque LUKS2 + déverrouillage vTPM (idem `--encrypt`) |
+| `LUKS_PW` | `ChangeMeLuks!` | phrase secrète LUKS (keyslot de secours manuel ; à surclasser dès que le lab sort de votre machine) |
+| `LUKS_TPM_PCRS` | vide | liaison TPM aux PCR (optionnelle — cf. [`docs/full-chain.md` § 4.2](docs/full-chain.md#42-disk-encryption---encrypt-luks2--vtpm-auto-unlock)) |
 | `WAIT_SSH_MAX_MIN` | `60` | délai max (min) d'attente du SSH du client |
 | `CLIENT_NAME`, `CLIENT_MAC` | `pxe-client`, `52:54:00:aa:00:10` | identité du nœud déployé (surclassable par `--client` / `--mac`) |
 
 Déploiement multi-nœuds (lab cluster) : `--client`, `--mac`, `--hostname`,
 `--vcpus`, `--ram`, `--disk-gb`, `--osd-disk-gb` — cf.
-[`docs/chaine-complete.md` § 4.1](docs/chaine-complete.md#41-conteneur-docker-celle-utilisée-par-la-chaîne).
+[`docs/full-chain.md` § 4.1](docs/full-chain.md#41-docker-container-the-one-used-by-the-chain).
 
 ---
 
@@ -183,7 +194,7 @@ Déploiement multi-nœuds (lab cluster) : `--client`, `--mac`, `--hostname`,
 ProxKnox/
 ├── README.md                      ← point d'entrée (ce fichier)
 ├── docs/
-│   ├── chaine-complete.md          ← référence détaillée (prérequis → dépannage)
+│   ├── full-chain.md          ← référence détaillée (prérequis → dépannage)
 │   ├── analyse-ansible.md         ← annexe : refonte du déploiement en Ansible ?
 │   └── runs/                       ← rapports générés, versionnés
 ├── deploy/                         ← déploiement PXE côté hôte
@@ -205,7 +216,7 @@ ProxKnox/
 │                                      (ansible-lockdown.DEBIAN13-CIS gitignoré,
 │                                      installé par --bootstrap)
 └── tools/
-    ├── chaine-complete.sh           ← orchestrateur de la chaîne complète
+    ├── full-chain.sh           ← orchestrateur de la chaîne complète
     ├── e2e-cluster-test.sh          ← procédure E2E cluster (--phase …)
     ├── audit-report.py               ← rapport d'audit consolidé md + html
     └── e2e-report.py                 ← rapport E2E md + html (page unique)
@@ -225,21 +236,22 @@ des VM, TFTP, preseeds, ISO en cache, logs (dont `dnsmasq.leases`,
 | Certificats UI (ACME/PKI, `pvenode cert set`) | HSE § 2.3.1/2.3.2 |
 | Sauvegardes 3-2-1 + test de restauration | HSE § 4.x |
 | Supervision centralisée (Prometheus/Grafana) | HSE § 5.2.x |
-| Secure Boot + chiffrement disque (avant usage réel) | HSE § 1.1.5/1.2.1 |
+| Secure Boot (chiffrement du disque lui-même : automatisé par `--encrypt`, cf. § 4.2 de la doc détaillée) | HSE § 1.1.5 (L3) |
 | Revue des « Manual Check Required » du rapport CIS | rapport § échecs résiduels |
 
 ## Sauter vers… (index de la documentation)
 
 | Besoin | Où |
 |---|---|
-| Prérequis détaillés (virtualisation imbriquée, paquets) | [`docs/chaine-complete.md` § 2](docs/chaine-complete.md#2-prérequis-contrôleur--machine-linux-locale) |
-| Modes netboot / ISO, options, variables d'env | [`docs/chaine-complete.md` § 3-4](docs/chaine-complete.md#3-mode-opératoire) |
-| Hardening : 12 rôles PVE, écarts CIS documentés | [`docs/chaine-complete.md` § 5](docs/chaine-complete.md#5-hardening) |
-| Audit → rapports (md/html, JSON embarqués) | [`docs/chaine-complete.md` § 6](docs/chaine-complete.md#6-audit--rapports) |
-| Test E2E cluster 3 nœuds (Ceph, migrations) | [`docs/chaine-complete.md` § 6bis](docs/chaine-complete.md#6bis-test-end-to-end-cluster-3-nœuds-ceph--live-migration) |
-| Ce qui reste manuel | [`docs/chaine-complete.md` § 7](docs/chaine-complete.md#7-ce-qui-reste-manuel-par-conception) |
-| Dépannage (16 incidents constatés sur runs réels) | [`docs/chaine-complete.md` § 8](docs/chaine-complete.md#8-dépannage-tous-constatés-lors-des-runs-réels) |
-| Éteindre / supprimer le lab | [`docs/chaine-complete.md` § 3.5](docs/chaine-complete.md#35-éteindre--supprimer-le-lab) |
+| Prérequis détaillés (virtualisation imbriquée, paquets) | [`docs/full-chain.md` § 2](docs/full-chain.md#2-prerequisites-controller--local-linux-machine) |
+| Modes netboot / ISO, options, variables d'env | [`docs/full-chain.md` § 3-4](docs/full-chain.md#3-operating-mode) |
+| Chiffrement disque — LUKS2 + déverrouillage vTPM (`--encrypt`) | [`docs/full-chain.md` § 4.2](docs/full-chain.md#42-disk-encryption---encrypt-luks2--vtpm-auto-unlock) |
+| Hardening : 12 rôles PVE, écarts CIS documentés | [`docs/full-chain.md` § 5](docs/full-chain.md#5-hardening) |
+| Audit → rapports (md/html, JSON embarqués) | [`docs/full-chain.md` § 6](docs/full-chain.md#6-audit--reports) |
+| Test E2E cluster 3 nœuds (Ceph, migrations) | [`docs/full-chain.md` § 6bis](docs/full-chain.md#6bis-end-to-end-3-node-cluster-test-ceph--live-migration) |
+| Ce qui reste manuel | [`docs/full-chain.md` § 7](docs/full-chain.md#7-what-remains-manual-by-design) |
+| Dépannage (16 incidents constatés sur runs réels) | [`docs/full-chain.md` § 8](docs/full-chain.md#8-troubleshooting-all-observed-during-real-runs) |
+| Éteindre / supprimer le lab | [`docs/full-chain.md` § 3.5](docs/full-chain.md#35-shutting-down--deleting-the-lab) |
 | Rapports des runs validés | [`docs/runs/`](docs/runs/) |
 
 ## Avertissements
@@ -248,7 +260,8 @@ des VM, TFTP, preseeds, ISO en cache, logs (dont `dnsmasq.leases`,
   système** : prévu pour un lab — évaluer chaque contrôle avant production.
 - `PermitRootLogin` restreint par CIS : administration via `adminlab`
   (sudo NOPASSWD) ou clés SSH.
-- Mots de passe par défaut de lab (`ChangeMeRoot!`/`ChangeMeAdmin!`) :
-  à surcharger (`ROOT_PW`/`ADMIN_PW`) dès que le lab sort de votre machine.
+- Mots de passe par défaut de lab (`ChangeMeRoot!`/`ChangeMeAdmin!`/
+  `ChangeMeLuks!`) : à surcharger (`ROOT_PW`/`ADMIN_PW`/`LUKS_PW`) dès
+  que le lab sort de votre machine.
 - Certains contrôles restent manuels par nature (2FA, BIOS/matériel,
   sauvegardes) — cf. § 7 ci-dessus.

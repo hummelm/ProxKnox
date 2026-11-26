@@ -11,9 +11,10 @@
             tools/full-chain.sh [--iso] [--bootstrap]
             │
  ┌──────────┴───────────────────────────────────────────────────────┐
- │ 1. DEPLOYMENT   pxe_deploy_container.py [--iso]                 │
+ │ 1. DEPLOYMENT   pxe_deploy_container.py [--iso] [--encrypt]     │
  │    pxe-lab network → proxknox-pxe container (DHCP/TFTP/DNS/HTTP/ │
  │    NAT) → pxe-client VM: PXE boot → Debian 13 auto-installed     │
+ │    (--encrypt: LUKS2 + vTPM auto-unlock, cf. § 4.2)              │
  │    → Proxmox VE 9.2 conversion (2 phases) → ansible/inventory/hosts.yml │
  ├──────────────────────────────────────────────────────────────────┤
  │ 2. PVE HARDENING harden-pve.yml (HomeSecExplorer guide v0.9.2)    │
@@ -55,6 +56,8 @@ Reference runs (Nov. 2026):
 - Member of the `libvirt` and `docker` groups (no root needed)
 - Active libvirt `default` network (virbr0, 192.168.122.0/24), SSH key
   pair (`~/.ssh/id_ed25519.pub`)
+- `--encrypt` only: `swtpm swtpm-tools` (vTPM 2.0 of the VMs,
+  started by libvirt from the emulator backend)
 
 Check without launching anything:
 
@@ -81,6 +84,7 @@ netboot. The run is idempotent: re-running it is safe.
 | Need | Command |
 |---|---|
 | Classic network deployment (Debian mirror) | `./tools/full-chain.sh` |
+| Node deployed with **LUKS2 + vTPM** auto-unlock | `./tools/full-chain.sh --iso --encrypt` |
 | Node already deployed: (re)run hardening + audit | `./tools/full-chain.sh --skip-deploy` |
 | PVE hardening only (without the CIS Lockdown) | `./tools/full-chain.sh --skip-deploy --skip-cis` |
 | Regenerate the audit report only | `./tools/full-chain.sh --reports-only` |
@@ -99,6 +103,9 @@ netboot. The run is idempotent: re-running it is safe.
 | `ISO_PATH` / `ISO_URL` | current DVD-1 cdimage | full ISO (`--iso` mode) |
 | `PVE_VERSION`, `NODE` | display | audit report labels |
 | `WAIT_SSH_MAX_MIN` | `60` | max wait (min) for the client's SSH |
+| `ENCRYPT_DISK` | empty | `1` = LUKS2 + vTPM auto-unlock (idem `--encrypt`) |
+| `LUKS_PW` | `ChangeMeLuks!` | LUKS passphrase (manual fallback keyslot) |
+| `LUKS_TPM_PCRS` | empty (no binding) | clevis TPM2 PCR binding, e.g. `7` or `0,2,7` |
 | `CLIENT_NAME`, `CLIENT_MAC` | `pxe-client`, `52:54:00:aa:00:10` | identity of the deployed node (overridable via `--client` / `--mac`) |
 
 ### 3.4 Accessing the result
@@ -195,6 +202,95 @@ python3 deploy/pxe_deploy_container.py --iso ~/isos/debian-…-DVD-1.iso
   `http.log`) that arms the Enter press + the reboot watchdog; the
   previous xorriso extraction leaves `r--`/`r-x` permissions → the
   directory is made writable before re-extraction.
+
+### 4.2 Disk encryption (`--encrypt`): LUKS2 + vTPM auto-unlock
+
+HSE § 1.2.1 "disk encryption, before production use" — automated here,
+**opt-in** to keep every reference run reproducible.
+
+```bash
+./tools/full-chain.sh --iso --encrypt          # node + full hardening
+python3 deploy/pxe_deploy_container.py --iso --encrypt --client pxe-node2 …
+ENCRYPT_DISK=1 ./tools/e2e-cluster-test.sh     # cluster variant (any node)
+```
+
+What the chain does, in order:
+
+1. **vTPM** — the VM gets a TPM 2.0 device (`tpm-crb`, swtpm emulator
+   backend, state in `/var/lib/libvirt/qemu/tpm/…`; needs `swtpm` +
+   `swtpm-tools` on the host). The state dies with the VM
+   (`virsh undefine --nvram`) exactly like its disk.
+2. **Partitioning** — the preseed switches `partman-auto` from `lvm` to
+   `crypto`: one **LUKS2 container** holds the whole VG (every `$lvmok`
+   volume of the CIS recipe: `/`, `/tmp`, `/var`, …, `/var/lib/vz`,
+   swap); `/boot` stays **unencrypted** (BIOS boot, GRUB cannot read
+   LUKS). Passphrase `LUKS_PW` (default lab `ChangeMeLuks!`), kept in
+   **keyslot 0 as the manual fallback**.
+3. **Enrollment** — right after d-i (and, in ISO mode, after the mirror
+   fixup), the orchestrator installs `clevis-luks clevis-tpm2
+   clevis-initramfs tpm2-tools` on the node and binds the container to
+   the tpm2 pin (`clevis luks bind`). `clevis-initramfs` is what ships
+   the **initramfs unlocker** (`scripts/local-top/clevis`); omitting it
+   leaves the token bound but the boot asking for the passphrase.
+   **Before** the PVE conversion: its 2 unattended
+   reboots need the automatic unlock (any later kernel/initramfs update
+   re-runs the initramfs hook without breaking it: with no PCR binding
+   there is no measurement policy to invalidate).
+   Why clevis and not `systemd-cryptenroll`: Debian 13/Proxmox unlock
+   the root inside an **initramfs-tools** environment; clevis ships the
+   initramfs unlocker (the orchestrator additionally forces the TPM
+   kernel modules into the initramfs via a hook).
+4. **Verification** — enrollment ends with a **reboot with nobody
+   there**: if the vTPM had not unlocked the disk, the node would block
+   on the cryptsetup prompt and the deployment would abort. The two
+   conversion reboots and the CIS reboot replay the same proof.
+
+**PCR policy** — the default binds **no PCR** (`clevis … tpm2 '{}'`).
+This lab boots via **SeaBIOS**, whose firmware measures *nothing* into
+the PCRs: a PCR policy would add no protection here, only a risk of a
+locked disk when the boot path changes. `LUKS_TPM_PCRS` (e.g. `7`, or
+`0,2,7`) enables the binding anyway — meaningful under UEFI/Secure Boot
+(HSE § 1.1.5, still manual), where an altered boot chain then provably
+refuses to unseal.
+
+Residual scope (by design): `/boot` is not encrypted (BIOS boot);
+OSD/Ceph disks are not covered by `--encrypt` (Ceph `dmcrypt` would be
+an e2e-variant of its own); the swtpm state is as trusted as the host.
+
+On the node (real layout of the encrypted chain: `vda1` = /boot ext4,
+`vda2` = extended, `vda5` = crypto_LUKS → `vda5_crypt` → `debian-vg`):
+
+```bash
+lsblk -f                                # crypto_LUKS -> vda5_crypt -> debian-vg
+sudo clevis luks status -d /dev/vda5    # tpm2 binding (keyslot 1)
+sudo cryptsetup luksDump /dev/vda5 | sed -n '/Tokens/,$p'
+```
+
+**Validated on 25/11/2026** (reports
+[`report-audit-cis-debian13-pve_2026-11-25.md`](runs/report-audit-cis-debian13-pve_2026-11-25.md)
+·
+[`report-e2e-cluster_2026-11-25.md`](runs/report-e2e-cluster_2026-11-25.md)):
+
+- `./tools/full-chain.sh --iso --encrypt` — LUKS2 container bound to
+  the vTPM (clevis tpm2, no PCR), **every reboot unattended**:
+  enrollment proof + 2 PVE-conversion reboots + the CIS reboot, then
+  12 hardening roles + CIS L2 (304 → 14 failures, **97.5 %**) and a
+  **0-deviation** PVE audit — the full chain runs hands-free with the
+  disk encrypted; nobody ever types the LUKS passphrase.
+- `ENCRYPT_DISK=1 ./tools/e2e-cluster-test.sh` — **12/12 pass** with
+  all **3 nodes** encrypted (pxe-client + pxe-node2/3): 3-vote quorum,
+  Ceph `HEALTH_OK` (3 OSDs, cephx + msgr2 secure), mini VM on RBD and
+  **2 online migrations (~9 s) with 0 lost ping response**. The
+  static-net reboots and the inter-node machinery (migration tunnel,
+  pvesh proxy, fail2ban) needed their own port-2222 wiring — cf.
+  § 8 troubleshooting.
+
+Hardening gap closed (HSE § 1.2.1): with `--encrypt`, **data at rest**
+of the node (all LVs, incl. `/var/lib/vz`) is protected — a stolen or
+disposed-of disk no longer exposes VM images, secrets or keys; the
+vTPM keeps reboots unattended and the passphrase stays as the manual
+fallback (change `LUKS_PW` outside the lab).
+
 
 ## 5. Hardening
 
@@ -315,7 +411,7 @@ place for inspection.
 | UI certificates (ACME/PKI, `pvenode cert set`) | HSE § 2.3.1/2.3.2 |
 | 3-2-1 backups + restore test | HSE § 4.x |
 | Centralized monitoring (Prometheus/Grafana, alerting) | HSE § 5.2.x |
-| Secure Boot + disk encryption (before any real use) | HSE § 1.1.5/1.2.1 (L3) |
+| Secure Boot (disk encryption itself is automated by `--encrypt`, § 4.2) | HSE § 1.1.5 (L3) |
 | Review of the "Manual Check Required" controls in the CIS report | report, § residual failures |
 
 ## 8. Troubleshooting (all observed during real runs)
@@ -338,6 +434,14 @@ place for inspection.
 | Live-migration: `Can't connect to destination address using public key` (ed25519) | `pve_ssh_audit` client block (HSE § 1.1.4) restricting `PubkeyAcceptedAlgorithms` to RSA → the cluster's ed25519 key (installed by `pvecm add --use_ssh`) is never offered | `PubkeyAcceptedAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256` in the role's client block |
 | Same while a manual `ssh -i` works | `/root/.ssh/id_ed25519` key copied via Ansible `copy: content:` → **trailing newline swallowed** → `error in libcrypto` | `411` bytes expected; `echo >>` as the fix |
 | Ceph `HEALTH_WARN — POOL_TOO_MANY_PGS` | pool created with the default 128 PGs while 3 OSDs call for 32 | `--pg_num 32` at creation (`e2e-cluster.yml` § 9) or `ceph osd pool set vmstorage pg_num 32` (progressive merge) |
+| `--encrypt`: `virsh start` fails (`swtpm`/setup not found) | host missing the vTPM packages | `apt install swtpm swtpm-tools` (checked by `--check` and the deployment prerequisites) |
+| `--encrypt`: deployment aborts right after "Encrypt: rebooting the node" | vTPM unlock failed → node blocked on the LUKS prompt (bad `LUKS_PW` at enrollment, missing TPM modules in the initramfs) | open the console (`virsh console pxe-client`), check the typed prompt; verify `/etc/initramfs-tools/hooks/proxknox-tpm`; correct `LUKS_PW` = redeploy (wipes the disk) |
+| `--encrypt` node boots but asks for the passphrase on the console | enrollment keyslot OK but clevis unlock broken later (initramfs rebuilt without the TPM hook, `LUKS_TPM_PCRS` set + boot path changed) | `clevis luks status -d /dev/vda2`; rebind: `clevis luks regen -d /dev/vda2 -t 1`; the passphrase (`LUKS_PW`) always unlocks manually |
+| Installing clevis times out with `--encrypt` in ISO mode | enrollment runs before the PVE conversion but **after** the mirror fixup — if the fixup failed, `apt` still points at the cdrom | check `iso-apt-fixup.sh` output earlier in the log (`deb.debian.org` sources required) |
+| `--encrypt` node boots but asks for the passphrase at the console (token bound) | trixie's clevis splits the initramfs unlocker out: `clevis-initramfs` missing | the chain installs it (apt line of `LUKS_TPM_ENROLL`); manual fix on the node: `apt install clevis-initramfs && update-initramfs -u` |
+| e2e cluster: `pvecm add`/`pvesh` between nodes refused or timing out | PVE's inter-node ssh dials **port 22** while the lab sshd listens on **2222** (deploy preseed); fail2ban may also ban a joiner after repeated failed attempts | the cluster phase installs `/etc/ssh/ssh_config.d/proxknox-lab.conf` (`Port 2222` for the node IPs); `fail2ban-client set sshd unbanip <ip>` clears an old ban |
+| e2e cluster: pvecm join "unable to copy ssh ID" then no nodes added | a corrupted formation key (`lookup('file')` had stripped the key's trailing newline → "not a key file") and repeated failed joins trigger fail2ban | fixed in `e2e-cluster.yml` (newline restored); check `fail2ban-client status sshd` and unban |
+| e2e Ceph: `pveceph` phases fail in apt (401 enterprise repo, [Y/n] abort) | PVE 9's `pveceph init/install` default to the enterprise repo (no subscription → 401) and aborts at apt's prompt without a tty | the play patches `ceph.sources` to the no-subscription repo and apt-gets the packages itself (`--repository no-subscription` alone still prompts) |
 
 ## 9. Directory layout
 

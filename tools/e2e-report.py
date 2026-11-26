@@ -78,19 +78,32 @@ def newest(pattern):
 
 
 def esc(x):
-    return _html.escape(str(x))
+    """html-escape."""
+    return (str(x).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def encrypted_mode():
+    """True when the cluster was deployed with ENCRYPT_DISK=1 (the e2e
+    script exposes its environment to this report tool)."""
+    return os.environ.get("ENCRYPT_DISK", "").strip().lower() in \
+        ("1", "true", "yes", "on")
 
 
 def generate_md(data, phases):
     n_p = sum(1 for r in data["results"] if r["status"] == "pass")
     n_f = sum(1 for r in data["results"] if r["status"] == "fail")
     n_nr = sum(1 for r in data["results"] if r["status"] == "notrun")
+    enc = data.get("disk-encryption")
+    enc = enc if enc is not None else encrypted_mode()
+    enc_line = ("- **Disk encryption**: LUKS2 + vTPM auto-unlock on every node "
+                "(clevis tpm2; `ENCRYPT_DISK=1`)\n" if enc else "")
     lines = [f"""# End-to-End test report — ProxKnox cluster (3 nodes)
 
 - **Scenario**: {data.get('scenario', '')}
 - **Lab nodes**: {', '.join(data.get('lab-nodes', []))}
 - **Date**: {data.get('date', '')}
-- **Verdict**: {"✅ PASS" if n_f == 0 else "❌ FAILURES (" + str(n_f) + ")"}{" — " + str(n_nr) + " test(s) not run" if n_nr else ""}
+{enc_line}- **Verdict**: {"✅ PASS" if n_f == 0 else "❌ FAILURES (" + str(n_f) + ")"}{" — " + str(n_nr) + " test(s) not run" if n_nr else ""}
 
 ## Overview
 
@@ -120,6 +133,10 @@ def generate_html(data, phases, out_html):
     n_f = sum(1 for r in data["results"] if r["status"] == "fail")
     n_nr = sum(1 for r in data["results"] if r["status"] == "notrun")
 
+    enc = encrypted_mode()
+    dep_enc = esc(". Nodes deployed with disk encryption: every root LUKS2 "
+                  "container auto-unlocked by its vTPM (clevis tpm2) — "
+                  "proven by the unattended enrollment reboot" if enc else "")
     cards = [
         f'<div class="card"><h3>E2E tests</h3><div class="big">{n_p}/{n}</div>'
         f'<div class="sub">tests passed{"" if not n_nr else f" — {n_nr} not run"}</div></div>',
@@ -128,6 +145,9 @@ def generate_html(data, phases, out_html):
         f'</div><div class="sub">{n_f} failure(s)</div></div>',
         '<div class="card"><h3>Lab</h3><div class="big">3 nodes</div>'
         '<div class="sub">PXE → cluster → Ceph → migrations</div></div>',
+        f'<div class="card"><h3>Disks</h3><div class="big">'
+        f'{"LUKS2 + vTPM" if enc else "plain"}</div>'
+        f'<div class="sub">{"auto-unlock (clevis tpm2) on every node" if enc else "no encryption (--encrypt / ENCRYPT_DISK=1 to enable)"}</div></div>',
     ]
     # migration durations if present in the findings
     durs = [m for r in data["results"] for m in re.findall(r"MigDur=(\d+)s", str(r.get("got", "")))]
@@ -173,7 +193,8 @@ def generate_html(data, phases, out_html):
 <h1>End-to-End tests — ProxKnox cluster (3 nodes)</h1>
 <p class="meta"><strong>Scenario</strong>: {esc(data.get('scenario', ''))}<br>
 <strong>Nodes</strong>: {esc(' · '.join(data.get('lab-nodes', [])))} ·
-<strong>Date</strong>: {esc(data.get('date', ''))}</p>
+<strong>Date</strong>: {esc(data.get('date', ''))}<br>
+<strong>Disks</strong>: {esc("LUKS2 + vTPM auto-unlock (all nodes)" if encrypted_mode() else "not encrypted (--encrypt / ENCRYPT_DISK=1 to enable)")}</p>
 <div class="cards">{''.join(cards)}</div>
 <h2>Per-phase detail (click to expand)</h2>
 {phase_html}
@@ -182,7 +203,7 @@ def generate_html(data, phases, out_html):
 <ol>
 <li><b>Deployment</b>: 3 Debian 13 nodes installed via real PXE
 (Docker container providing DHCP/TFTP/HTTP/NAT), one dedicated OSD disk
-per node, converted to Proxmox VE 9.2.</li>
+per node, converted to Proxmox VE 9.2{dep_enc}.</li>
 <li><b>Network</b>: static vmbr0 (192.168.200.11/12/13), hostnames
 proxknox-node1/2/3 — a stable base for corosync/Ceph.</li>
 <li><b>Cluster</b>: <code>pvecm create/add</code> — 3-vote quorum.</li>

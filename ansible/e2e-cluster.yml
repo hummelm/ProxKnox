@@ -73,9 +73,24 @@
                   bridge-stp off
                   bridge-fd 0
 
-    - name: Reboot (new networking takes effect)
-      ansible.builtin.reboot:
-        reboot_timeout: 300
+    # ⚠ NOT ansible.builtin.reboot: after the switch to the static vmbr0
+    # the node answers on e2e_ip ONLY — the reboot module would poll the
+    # old DHCP lease address until its timeout. Fire-and-forget reboot,
+    # then wait for sshd at the NEW address (also proves the LUKS disk
+    # was auto-unlocked by the vTPM — nobody types a passphrase here).
+    - name: Reboot (fire and forget — new networking takes effect)
+      ansible.builtin.shell: nohup bash -c 'sleep 2; reboot' >/dev/null 2>&1 &
+      changed_when: true
+      failed_when: false
+
+    - name: Wait — the node is back at its new static address
+      ansible.builtin.wait_for:
+        host: "{{ e2e_ip }}"
+        port: 2222
+        delay: 20
+        timeout: 420
+      delegate_to: localhost
+      become: false
 
 - name: "E2E — 2. Cluster formation SSH key (controller)"
   hosts: localhost
@@ -111,15 +126,42 @@
       ansible.builtin.copy:
         dest: /root/.ssh/id_ed25519
         mode: "0600"
-        content: "{{ lookup('ansible.builtin.file', e2e_cluster_key) }}"
+        # lookup('file') strips the trailing newline; without it the
+        # OPENSSH private key is invalid ("not a key file") and the
+        # join keeps auth-failing until fail2ban bans the joiner.
+        content: "{{ lookup('ansible.builtin.file', e2e_cluster_key) }}\n"
       when: ansible_host != e2e_node1_ip
 
     - name: known_hosts entry for node1 on the joining nodes
       ansible.builtin.known_hosts:
-        name: "{{ e2e_node1_ip }}"
-        key: "{{ lookup('pipe', 'ssh-keyscan -t ed25519 ' + e2e_node1_ip) }}"
+        # node sshd listens on 2222 (deploy preseed), not 22: the join
+        # connects to [192.168.200.11]:2222, and non-default-port ssh
+        # matches known_hosts entries tagged "[ip]:port" only — so key
+        # and name both carry the bracketed form (as keyscan emits it).
+        name: "[{{ e2e_node1_ip }}]:2222"
+        key: "{{ lookup('pipe', 'ssh-keyscan -p 2222 -t ed25519 ' + e2e_node1_ip) }}"
         path: /root/.ssh/known_hosts
       when: ansible_host != e2e_node1_ip
+
+    - name: ssh_config — pvecm add (--use_ssh) must reach node1 on port 2222
+      ansible.builtin.copy:
+        dest: /root/.ssh/config
+        mode: "0600"
+        content: |
+          Host {{ e2e_node1_ip }}
+                  Port 2222
+      when: ansible_host != e2e_node1_ip
+
+    - name: system-wide ssh client port 2222 (PVE cluster machinery)
+      # pvesh/qm proxy between nodes sshes to the peer on port 22 — the
+      # lab sshd listens on 2222 only (deploy preseed); without this,
+      # every cluster-wide API call from another node fails (refused)
+      ansible.builtin.copy:
+        dest: /etc/ssh/ssh_config.d/proxknox-lab.conf
+        mode: "0644"
+        content: |
+          Host 192.168.200.11 192.168.200.12 192.168.200.13
+                  Port 2222
 
 - name: "E2E — 4. pvecm create (node1)"
   hosts: pxe-client
@@ -148,11 +190,11 @@
       ansible.builtin.command: pvecm create proxknox-lab --link0 192.168.200.11
       when: not _corosync.stat.exists
 
-    - name: Wait for quorum (1 vote expected at this stage)
+    - name: Wait for quorum (1 vote at creation; more when re-running)
       ansible.builtin.command: pvecm status
       register: _st1
       changed_when: false
-      until: _st1.stdout is search('Quorum:.*1')
+      until: _st1.stdout is search('Quorate:.*Yes')
       retries: 12
       delay: 5
 
@@ -180,7 +222,9 @@
       ansible.builtin.command: pvecm status
       register: _st3
       changed_when: false
-      until: _st3.stdout is search('Quorum:.*3')
+      # NOT 'Quorum:.*3': with 3 votes the quorum THRESHOLD prints 2 —
+      # the membership proof is Total votes: 3 (all nodes present).
+      until: _st3.stdout is search('Total votes:.*3')
       retries: 12
       delay: 5
 
@@ -199,6 +243,28 @@
       ansible.builtin.command: pveceph init --network 192.168.200.0/24
       when: not _ceph.stat.exists
 
+    - name: First monitor + manager (init writes the config only)
+      # idempotent: each create runs only when its daemon answers.
+      # pveceph install aborts at apt's [Y/n] under non-interactive
+      # stdin (and defaults to the 401-ing enterprise repo): install
+      # the packages ourselves from the no-subscription repo.
+      ansible.builtin.shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        if [ ! -x /usr/bin/ceph-mon ] || [ ! -x /usr/bin/ceph-mgr ]; then
+          sed -i -e 's#enterprise\.proxmox\.com/debian/ceph-#download.proxmox.com/debian/ceph-#' \
+                 -e 's/^Components: enterprise$/Components: no-subscription/' \
+                 /etc/apt/sources.list.d/ceph.sources
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            ceph-mon ceph-mgr ceph-mgr-modules-core ceph-volume ceph-common
+        fi
+        ceph -s >/dev/null 2>&1 || pveceph mon create
+        ceph -s --format json 2>/dev/null | grep -q '"available":true' \
+          || pveceph mgr create
+      args:
+        executable: /bin/bash
+      changed_when: false
+
     - name: Wait for the monitor (HEALTH check reachable)
       ansible.builtin.command: ceph -s
       register: _cs
@@ -215,14 +281,39 @@
   tags: [ceph]
   tasks:
     - name: Install Ceph on this node if needed
+      # pveceph osd create needs ceph-mon present too; the packages come
+      # from the same no-subscription tentacle repo as on node1 (the
+      # enterprise default 401s without a subscription).
       ansible.builtin.shell: |
-        command -v ceph-osd >/dev/null 2>&1 || apt-get install -y --no-install-recommends ceph-osd ceph-common
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        if ! grep -q 'ceph-tentacle' /etc/apt/sources.list.d/ceph.sources 2>/dev/null; then
+          printf '%s\n' \
+            'Types: deb' \
+            'URIs: http://download.proxmox.com/debian/ceph-tentacle' \
+            'Suites: trixie' \
+            'Components: no-subscription' \
+            'Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg' \
+            > /etc/apt/sources.list.d/ceph.sources
+          apt-get update -qq
+        fi
+        need=0
+        for b in /usr/bin/ceph-osd /usr/bin/ceph-mon /usr/sbin/ceph-volume; do
+          [ -x "$b" ] || need=1
+        done
+        if [ "$need" = 1 ]; then
+          apt-get install -y -qq --no-install-recommends \
+            ceph-mon ceph-osd ceph-volume ceph-common
+        fi
       args:
         executable: /bin/bash
 
     - name: Create the OSD on the dedicated disk (attempts with PVE syntaxes)
       ansible.builtin.shell: |
         set -e
+        if ceph osd tree 2>/dev/null | grep -q "$(hostname -s)"; then
+          echo "OSD already present on $(hostname -s)"; exit 0
+        fi
         osd="$(lsblk -ndo NAME,TYPE,SERIAL | awk '$2=="disk"{d="/dev/"$1} END{print d}')"
         if [ -z "$osd" ] || [ "$osd" = "/dev/vda" ]; then
           echo "OSD-DISK-MISSING"; exit 1
